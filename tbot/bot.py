@@ -438,6 +438,103 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def get_user_full_name(user_id: int) -> str:
+    """Возвращает полное имя пользователя или понятную заглушку."""
+
+    user = USERS.get(user_id)
+    if user is None:
+        return "Неизвестный"
+    return user.full_name
+
+
+def detect_user_role(task: Task, user_id: int) -> str:
+    """Определяет роль пользователя в задаче."""
+
+    if user_id == task.author_id:
+        return "author"
+    if user_id == task.responsible_user_id:
+        return "responsible"
+    if user_id in task.workgroup:
+        return "workgroup"
+    return "viewer"
+
+
+def get_allowed_reminder_targets(task: Task, actor_id: int) -> set[int]:
+    """Возвращает список пользователей, которым можно отправить напоминание."""
+
+    role = detect_user_role(task, actor_id)
+    if role not in {"author", "responsible"}:
+        return set()
+
+    participants = set(get_task_participants(task))
+    participants.discard(actor_id)
+
+    if role == "responsible":
+        participants.discard(task.author_id)
+
+    return participants
+
+
+async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_description: str) -> None:
+    """Отправляет уведомление всем участникам о действии по задаче."""
+
+    actor_name = get_user_full_name(actor_id)
+    notification_text = (
+        "ℹ️ <b>Изменение по задаче</b>\n\n"
+        f"📝 <b>{task.title}</b>\n"
+        f"👤 {actor_name} {action_description}"
+    )
+
+    recipients = set(get_task_participants(task))
+
+    for recipient_id in recipients:
+        user = USERS.get(recipient_id)
+        if user is None:
+            continue
+        try:
+            await bot.send_message(chat_id=recipient_id, text=notification_text)
+        except Exception as error:
+            LOGGER.error(
+                "Не удалось отправить уведомление пользователю %s: %s",
+                recipient_id,
+                error,
+            )
+
+
+async def send_task_reminder(
+    bot: Bot,
+    task: Task,
+    actor_id: int,
+    recipients: Iterable[int],
+) -> None:
+    """Отправляет напоминание выбранным участникам."""
+
+    refresh_task_status(task)
+    actor_name = get_user_full_name(actor_id)
+    due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
+    reminder_text = (
+        "🔔 <b>Напоминание о задаче</b>\n\n"
+        f"📝 <b>{task.title}</b>\n"
+        f"👤 От: {actor_name}\n"
+        f"📆 Срок: {due_date}\n"
+        f"📊 Статус: {task.status.value}\n\n"
+        "Пожалуйста, уделите внимание выполнению задачи."
+    )
+
+    for recipient_id in recipients:
+        user = USERS.get(recipient_id)
+        if user is None:
+            continue
+        try:
+            await bot.send_message(chat_id=recipient_id, text=reminder_text)
+        except Exception as error:
+            LOGGER.error(
+                "Не удалось отправить напоминание пользователю %s: %s",
+                recipient_id,
+                error,
+            )
+
+
 def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str:
     """Формирует текстовое представление списка задач с нумерацией."""
 
@@ -788,98 +885,6 @@ def create_dispatcher() -> Dispatcher:
             if "message is not modified" in error.message:
                 return
             raise
-
-    async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_description: str) -> None:
-        """Отправляет уведомление всем участникам о действии по задаче."""
-
-        actor_name = get_user_full_name(actor_id)
-        notification_text = (
-            "ℹ️ <b>Изменение по задаче</b>\n\n"
-            f"📝 <b>{task.title}</b>\n"
-            f"👤 {actor_name} {action_description}"
-        )
-
-        recipients = set(get_task_participants(task))
-
-        for recipient_id in recipients:
-            user = USERS.get(recipient_id)
-            if user is None:
-                continue
-            try:
-                await bot.send_message(chat_id=recipient_id, text=notification_text)
-            except Exception as error:
-                LOGGER.error(
-                    "Не удалось отправить уведомление пользователю %s: %s",
-                    recipient_id,
-                    error,
-                )
-
-    async def send_task_reminder(
-        bot: Bot,
-        task: Task,
-        actor_id: int,
-        recipients: Iterable[int],
-    ) -> None:
-        """Отправляет напоминание выбранным участникам."""
-
-        refresh_task_status(task)
-        actor_name = get_user_full_name(actor_id)
-        due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
-        reminder_text = (
-            "🔔 <b>Напоминание о задаче</b>\n\n"
-            f"📝 <b>{task.title}</b>\n"
-            f"👤 От: {actor_name}\n"
-            f"📆 Срок: {due_date}\n"
-            f"📊 Статус: {task.status.value}\n\n"
-            "Пожалуйста, уделите внимание выполнению задачи."
-        )
-
-        for recipient_id in recipients:
-            user = USERS.get(recipient_id)
-            if user is None:
-                continue
-            try:
-                await bot.send_message(chat_id=recipient_id, text=reminder_text)
-            except Exception as error:
-                LOGGER.error(
-                    "Не удалось отправить напоминание пользователю %s: %s",
-                    recipient_id,
-                    error,
-                )
-
-    def detect_user_role(task: Task, user_id: int) -> str:
-        """Определяет роль пользователя в задаче."""
-
-        if user_id == task.author_id:
-            return "author"
-        if user_id == task.responsible_user_id:
-            return "responsible"
-        if user_id in task.workgroup:
-            return "workgroup"
-        return "viewer"
-
-    def get_user_full_name(user_id: int) -> str:
-        """Возвращает полное имя пользователя или понятную заглушку."""
-
-        user = USERS.get(user_id)
-        if user is None:
-            return "Неизвестный"
-        return user.full_name
-
-    def get_allowed_reminder_targets(task: Task, actor_id: int) -> set[int]:
-        """Возвращает список пользователей, которым можно отправить напоминание."""
-
-        role = detect_user_role(task, actor_id)
-        if role not in {"author", "responsible"}:
-            return set()
-
-        participants = set(get_task_participants(task))
-        participants.discard(actor_id)
-
-        if role == "responsible":
-            participants.discard(task.author_id)
-
-        return participants
 
     def build_creation_header(data: dict) -> str:
         """Формирует заголовок с текущими параметрами создаваемой задачи."""
