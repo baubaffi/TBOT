@@ -10,6 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Iterable
 from .greeting import greet_user
 from .users import USERS, User, get_direction_label, get_users_by_direction
 from .tasks import (
@@ -165,10 +166,11 @@ def tasks_filter_kb(back_to: str = "main"):
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Активные", callback_data="filter_active"),
-                InlineKeyboardButton(text="Завершенные", callback_data="filter_completed")
+                InlineKeyboardButton(text="На проверке", callback_data="filter_review"),
             ],
             [
-                InlineKeyboardButton(text="Все задачи", callback_data="filter_all")
+                InlineKeyboardButton(text="Завершенные", callback_data="filter_completed"),
+                InlineKeyboardButton(text="Все задачи", callback_data="filter_all"),
             ],
             [
                 InlineKeyboardButton(text="🏠 Главная", callback_data=f"back_{back_to}")
@@ -182,6 +184,7 @@ STATUS_ICONS = {
     TaskStatus.NEW: "🆕",
     TaskStatus.ACTIVE: "🔄",
     TaskStatus.PAUSED: "⏸️",
+    TaskStatus.IN_REVIEW: "🔍",
     TaskStatus.COMPLETED: "✅",
     TaskStatus.OVERDUE: "⏰",
 }
@@ -265,7 +268,7 @@ def users_kb(users: list[User], selected_users: set[int], action: str, back_to: 
         selected = "✅ " if user.user_id in selected_users else ""
         buttons.append([
             InlineKeyboardButton(
-                text=f"{selected}{user.first_name}", 
+                text=f"{selected}{user.full_name}",
                 callback_data=f"{action}_{user.user_id}"
             )
         ])
@@ -348,7 +351,6 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
             ])
             buttons.append([
                 InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}"),
-                InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_task:{context}"),
             ])
         else:
             if not is_author and not awaiting_confirmation:
@@ -373,15 +375,35 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
             if management_row:
                 buttons.append(management_row)
 
-            if (is_author or is_responsible) and not is_current_executor:
+            if is_author and not is_current_executor:
                 buttons.append([
-                    InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_task:{context}"),
+                    InlineKeyboardButton(text="♻️ Сброс состояния", callback_data=f"reset_task_request:{context}"),
                 ])
+
+        reminder_targets = get_allowed_reminder_targets(task, viewer_id)
+        if reminder_targets:
+            buttons.append([
+                InlineKeyboardButton(text="🔔 Напомнить всем", callback_data=f"remind_all:{context}"),
+            ])
+            for participant_id in sorted(reminder_targets):
+                participant_name = get_user_full_name(participant_id)
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"🔔 Напомнить: {participant_name}",
+                        callback_data=(
+                            f"remind_one:{task.task_id}:{participant_id}:{view}:{filter_type}:{page}"
+                        ),
+                    )
+                ])
+
+    if is_author and task.status != TaskStatus.COMPLETED:
+        buttons.append([
+            InlineKeyboardButton(text="🏁 Завершить задачу", callback_data=f"complete_task_author:{context}"),
+        ])
 
     if is_author and task.pending_confirmations:
         for participant_id in sorted(task.pending_confirmations):
-            user = USERS.get(participant_id)
-            participant_name = user.first_name if user else "Неизвестный"
+            participant_name = get_user_full_name(participant_id)
             buttons.append([
                 InlineKeyboardButton(
                     text=f"✅ Подтвердить: {participant_name}",
@@ -431,7 +453,7 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
         status_icon = STATUS_ICONS.get(task.status, "❓")
         priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
         overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
-        responsible_name = USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else "Неизвестный"
+        responsible_name = get_user_full_name(task.responsible_user_id)
         due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Без срока"
 
         lines.extend([
@@ -441,7 +463,7 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
         ])
 
         if task.current_executor_id and task.current_executor_id in USERS:
-            executor_name = USERS[task.current_executor_id].first_name
+            executor_name = get_user_full_name(task.current_executor_id)
             lines.append(f"   👷 Исполнитель: {executor_name}")
 
         lines.append("")
@@ -450,16 +472,20 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
     return "\n".join(lines)
 
 
-def build_task_detail_text(task: Task) -> str:
+def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
     """Формирует подробное описание задачи."""
 
     refresh_task_status(task)
-    responsible_name = USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else "Неизвестный"
-    author_name = USERS[task.author_id].first_name if task.author_id in USERS else "Неизвестный"
+    viewer_role = "viewer"
+    if viewer_id is not None:
+        viewer_role = detect_user_role(task, viewer_id)
+
+    responsible_name = get_user_full_name(task.responsible_user_id)
+    author_name = get_user_full_name(task.author_id)
     due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
     created = task.created_date.strftime('%d.%m.%Y')
     workgroup_names = [
-        USERS[user_id].first_name
+        get_user_full_name(user_id)
         for user_id in task.workgroup
         if user_id in USERS
     ]
@@ -471,7 +497,7 @@ def build_task_detail_text(task: Task) -> str:
     priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
     executor_name = None
     if task.current_executor_id and task.current_executor_id in USERS:
-        executor_name = USERS[task.current_executor_id].first_name
+        executor_name = get_user_full_name(task.current_executor_id)
 
     lines = [
         f"📝 <b>{task.title}</b>",
@@ -491,40 +517,40 @@ def build_task_detail_text(task: Task) -> str:
     if executor_name:
         lines.append(f"👷 Исполнитель: {executor_name}")
 
-    participant_lines: list[str] = []
-    for participant_id in sorted(get_task_participants(task)):
-        user = USERS.get(participant_id)
-        participant_name = user.first_name if user else "Неизвестный"
-        if participant_id == task.author_id:
-            role_label = "Автор"
-        elif participant_id == task.responsible_user_id:
-            role_label = "Ответственный"
-        else:
-            role_label = "Рабочая группа"
-        participant_status = get_participant_status(task, participant_id).value
-        marker = ""
-        if participant_id in task.pending_confirmations:
-            marker = " (ожидает подтверждения)"
-        participant_lines.append(
-            f"   • {participant_name} ({role_label}) — {participant_status}{marker}"
-        )
+    if viewer_role in {"author", "responsible"}:
+        participant_lines: list[str] = []
+        for participant_id in sorted(get_task_participants(task)):
+            if viewer_role == "responsible" and participant_id == task.author_id:
+                continue
 
-    if participant_lines:
-        lines.append("👥 Статусы участников:")
-        lines.extend(participant_lines)
+            participant_name = get_user_full_name(participant_id)
+            if participant_id == task.author_id:
+                role_label = "Автор"
+            elif participant_id == task.responsible_user_id:
+                role_label = "Ответственный"
+            else:
+                role_label = "Рабочая группа"
+            participant_status = get_participant_status(task, participant_id).value
+            marker = ""
+            if participant_id in task.pending_confirmations:
+                marker = " (ожидает подтверждения)"
+            participant_lines.append(
+                f"   • {participant_name} ({role_label}) — {participant_status}{marker}"
+            )
+
+        if participant_lines:
+            lines.append("👥 Статусы участников:")
+            lines.extend(participant_lines)
 
     if task.awaiting_author_confirmation and task.pending_confirmations:
         pending_names = [
-            USERS.get(participant_id).first_name
-            if USERS.get(participant_id)
-            else "Неизвестный"
+            get_user_full_name(participant_id)
             for participant_id in task.pending_confirmations
         ]
         lines.append(f"📨 На подтверждении: {', '.join(pending_names)}")
 
     if task.last_action and task.last_actor_id:
-        actor = USERS.get(task.last_actor_id)
-        actor_name = actor.first_name if actor else "Неизвестный"
+        actor_name = get_user_full_name(task.last_actor_id)
         if task.last_action_time:
             action_time = task.last_action_time.strftime('%d.%m.%Y %H:%M')
             lines.append(f"📌 Последнее действие: {task.last_action} — {actor_name} ({action_time})")
@@ -707,6 +733,7 @@ def get_help_section_text(section: str, user_id: int) -> str:
             "• <b>Новые</b> - ожидают назначения\n"
             "• <b>В работе</b> - выполняются\n"
             "• <b>На паузе</b> - временно приостановлены\n"
+            "• <b>На проверке</b> - ожидают подтверждения автора\n"
             "• <b>Завершено</b> - выполнены\n"
             "• <b>Просрочено</b> - не выполнены в срок"
         ),
@@ -765,8 +792,7 @@ def create_dispatcher() -> Dispatcher:
     async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_description: str) -> None:
         """Отправляет уведомление всем участникам о действии по задаче."""
 
-        actor = USERS.get(actor_id)
-        actor_name = actor.first_name if actor else "Неизвестный пользователь"
+        actor_name = get_user_full_name(actor_id)
         notification_text = (
             "ℹ️ <b>Изменение по задаче</b>\n\n"
             f"📝 <b>{task.title}</b>\n"
@@ -788,6 +814,39 @@ def create_dispatcher() -> Dispatcher:
                     error,
                 )
 
+    async def send_task_reminder(
+        bot: Bot,
+        task: Task,
+        actor_id: int,
+        recipients: Iterable[int],
+    ) -> None:
+        """Отправляет напоминание выбранным участникам."""
+
+        refresh_task_status(task)
+        actor_name = get_user_full_name(actor_id)
+        due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
+        reminder_text = (
+            "🔔 <b>Напоминание о задаче</b>\n\n"
+            f"📝 <b>{task.title}</b>\n"
+            f"👤 От: {actor_name}\n"
+            f"📆 Срок: {due_date}\n"
+            f"📊 Статус: {task.status.value}\n\n"
+            "Пожалуйста, уделите внимание выполнению задачи."
+        )
+
+        for recipient_id in recipients:
+            user = USERS.get(recipient_id)
+            if user is None:
+                continue
+            try:
+                await bot.send_message(chat_id=recipient_id, text=reminder_text)
+            except Exception as error:
+                LOGGER.error(
+                    "Не удалось отправить напоминание пользователю %s: %s",
+                    recipient_id,
+                    error,
+                )
+
     def detect_user_role(task: Task, user_id: int) -> str:
         """Определяет роль пользователя в задаче."""
 
@@ -798,6 +857,29 @@ def create_dispatcher() -> Dispatcher:
         if user_id in task.workgroup:
             return "workgroup"
         return "viewer"
+
+    def get_user_full_name(user_id: int) -> str:
+        """Возвращает полное имя пользователя или понятную заглушку."""
+
+        user = USERS.get(user_id)
+        if user is None:
+            return "Неизвестный"
+        return user.full_name
+
+    def get_allowed_reminder_targets(task: Task, actor_id: int) -> set[int]:
+        """Возвращает список пользователей, которым можно отправить напоминание."""
+
+        role = detect_user_role(task, actor_id)
+        if role not in {"author", "responsible"}:
+            return set()
+
+        participants = set(get_task_participants(task))
+        participants.discard(actor_id)
+
+        if role == "responsible":
+            participants.discard(task.author_id)
+
+        return participants
 
     def build_creation_header(data: dict) -> str:
         """Формирует заголовок с текущими параметрами создаваемой задачи."""
@@ -835,7 +917,7 @@ def create_dispatcher() -> Dispatcher:
         responsible_users = data.get("responsible_users")
         if responsible_users:
             names = [
-                USERS[user_id].first_name
+                get_user_full_name(user_id)
                 for user_id in responsible_users
                 if user_id in USERS
             ]
@@ -845,7 +927,7 @@ def create_dispatcher() -> Dispatcher:
         workgroup_users = data.get("workgroup_users")
         if workgroup_users:
             names = [
-                USERS[user_id].first_name
+                get_user_full_name(user_id)
                 for user_id in workgroup_users
                 if user_id in USERS
             ]
@@ -1367,8 +1449,7 @@ def create_dispatcher() -> Dispatcher:
             all_notified_users = {responsible_user_id}
             all_notified_users.update(workgroup_users)
 
-            responsible_user = USERS.get(responsible_user_id)
-            responsible_name = responsible_user.first_name if responsible_user else "Неизвестный"
+            responsible_name = get_user_full_name(responsible_user_id)
 
             for notified_user_id in all_notified_users:
                 user = USERS.get(notified_user_id)
@@ -1642,6 +1723,8 @@ def create_dispatcher() -> Dispatcher:
 
         if filter_type == "active":
             return [task for task in tasks if task.status == TaskStatus.ACTIVE], "активные"
+        if filter_type == "review":
+            return [task for task in tasks if task.status == TaskStatus.IN_REVIEW], "на проверке"
         if filter_type == "completed":
             return [task for task in tasks if task.status == TaskStatus.COMPLETED], "завершенные"
         return tasks, "все"
@@ -1656,7 +1739,7 @@ def create_dispatcher() -> Dispatcher:
     ) -> None:
         """Обновляет сообщение с карточкой задачи."""
 
-        text = build_task_detail_text(task)
+        text = build_task_detail_text(task, viewer_id)
         keyboard = task_detail_kb(task, viewer_id, view, filter_type, page)
 
         await safe_edit_message(
@@ -1921,6 +2004,25 @@ def create_dispatcher() -> Dispatcher:
 
         return default_context
 
+    def extract_reminder_context(callback_data: str) -> tuple[int, int, str, str, int]:
+        """Получает параметры для напоминания конкретному участнику."""
+
+        default_context = (0, 0, "notify", "all", 1)
+
+        if callback_data.startswith("remind_one:"):
+            parts = callback_data.split(":", 5)
+            if len(parts) == 6:
+                _, task_id_str, participant_id_str, view, filter_type, page_str = parts
+                try:
+                    task_id = int(task_id_str)
+                    participant_id = int(participant_id_str)
+                    page = int(page_str)
+                except ValueError:
+                    return default_context
+                return task_id, participant_id, view, filter_type, page
+
+        return default_context
+
     def can_manage_task(task: Task, user_id: int) -> bool:
         """Проверяет, может ли пользователь управлять задачей."""
 
@@ -2054,38 +2156,164 @@ def create_dispatcher() -> Dispatcher:
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
         await callback.answer(answer_text)
 
-    @dispatcher.callback_query(F.data.startswith("cancel_task"))
-    async def handle_cancel_task_action(callback: CallbackQuery, state: FSMContext) -> None:
-        """Обрабатывает отмену выполнения задачи."""
+    @dispatcher.callback_query(F.data.startswith("reset_task_request"))
+    async def handle_reset_task_request(callback: CallbackQuery, state: FSMContext) -> None:
+        """Запрашивает подтверждение сброса состояния задачи."""
 
-        task, view, filter_type, page = await ensure_task_for_action(callback, "cancel_task")
+        task, view, filter_type, page = await ensure_task_for_action(callback, "reset_task_request")
         if task is None:
             return
 
         user_id = callback.from_user.id
-        if not can_manage_task(task, user_id):
-            await callback.answer("Нет прав для отмены", show_alert=True)
+        if user_id != task.author_id:
+            await callback.answer("Сброс состояния доступен только автору", show_alert=True)
             return
 
-        role = detect_user_role(task, user_id)
-        if role in {"author", "responsible"}:
-            set_all_participants_status(task, TaskStatus.NEW)
-            task.current_executor_id = None
-            task.completed_date = None
-            task.status_before_overdue = None
-            clear_pending_confirmations(task)
-        else:
-            set_participant_status(task, user_id, TaskStatus.NEW)
-            if task.current_executor_id == user_id:
-                task.current_executor_id = None
-            task.completed_date = None
-            task.status_before_overdue = None
-            remove_pending_confirmation(task, user_id)
-            recalc_task_status(task)
-        record_task_action(task, user_id, "Отменил выполнение задачи")
+        warning_text = (
+            f"{build_task_detail_text(task, user_id)}\n\n"
+            "⚠️ Подтвердите сброс состояния задачи."
+        )
+        confirmation_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить сброс",
+                        callback_data=f"reset_task_confirm:{task.task_id}:{view}:{filter_type}:{page}",
+                    ),
+                    InlineKeyboardButton(
+                        text="⬅️ Отмена",
+                        callback_data=f"reset_task_cancel:{task.task_id}:{view}:{filter_type}:{page}",
+                    ),
+                ]
+            ]
+        )
+
+        await safe_edit_message(callback.message, text=warning_text, reply_markup=confirmation_keyboard)
+        await callback.answer()
+
+    @dispatcher.callback_query(F.data.startswith("reset_task_cancel"))
+    async def handle_reset_task_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        """Отменяет процедуру сброса состояния."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "reset_task_cancel")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if user_id != task.author_id:
+            await callback.answer("Сброс состояния доступен только автору", show_alert=True)
+            return
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
-        await callback.answer("Задача освобождена")
+        await callback.answer("Сброс отменён")
+
+    @dispatcher.callback_query(F.data.startswith("reset_task_confirm"))
+    async def handle_reset_task_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        """Сбрасывает состояние задачи после подтверждения."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "reset_task_confirm")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if user_id != task.author_id:
+            await callback.answer("Сброс состояния доступен только автору", show_alert=True)
+            return
+
+        set_all_participants_status(task, TaskStatus.NEW)
+        task.current_executor_id = None
+        task.completed_date = None
+        task.status_before_overdue = None
+        clear_pending_confirmations(task)
+
+        record_task_action(task, user_id, "Сбросил состояние задачи")
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            "сбросил(а) состояние задачи.",
+        )
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Состояние сброшено")
+
+    @dispatcher.callback_query(F.data.startswith("remind_all"))
+    async def handle_remind_all(callback: CallbackQuery, state: FSMContext) -> None:
+        """Отправляет напоминание всем доступным участникам."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "remind_all")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        recipients = get_allowed_reminder_targets(task, user_id)
+        if not recipients:
+            await callback.answer("Нет участников для напоминания", show_alert=True)
+            return
+
+        await send_task_reminder(callback.bot, task, user_id, recipients)
+        record_task_action(task, user_id, "Отправил напоминание всем участникам")
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Напоминание отправлено")
+
+    @dispatcher.callback_query(F.data.startswith("remind_one:"))
+    async def handle_remind_one(callback: CallbackQuery, state: FSMContext) -> None:
+        """Отправляет напоминание конкретному участнику."""
+
+        task_id, participant_id, view, filter_type, page = extract_reminder_context(callback.data)
+        task = TASKS.get(task_id)
+
+        if not task:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+
+        user_id = callback.from_user.id
+        recipients = get_allowed_reminder_targets(task, user_id)
+        if participant_id not in recipients:
+            await callback.answer("Нельзя напоминать этому участнику", show_alert=True)
+            return
+
+        await send_task_reminder(callback.bot, task, user_id, [participant_id])
+        participant_name = get_user_full_name(participant_id)
+        record_task_action(
+            task,
+            user_id,
+            f"Отправил напоминание участнику {participant_name}",
+        )
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Напоминание отправлено")
+
+    @dispatcher.callback_query(F.data.startswith("complete_task_author"))
+    async def handle_author_completion(callback: CallbackQuery, state: FSMContext) -> None:
+        """Позволяет автору завершить задачу в любой момент."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "complete_task_author")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if user_id != task.author_id:
+            await callback.answer("Завершить задачу может только автор", show_alert=True)
+            return
+
+        set_all_participants_status(task, TaskStatus.COMPLETED)
+        task.completed_date = datetime.now()
+        task.current_executor_id = None
+        task.status_before_overdue = None
+        clear_pending_confirmations(task)
+
+        record_task_action(task, user_id, "Завершил задачу")
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            "завершил(а) задачу.",
+        )
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Задача завершена")
 
     @dispatcher.callback_query(F.data.startswith("postpone_task"))
     async def handle_postpone_task(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2248,7 +2476,7 @@ def create_dispatcher() -> Dispatcher:
             message.bot,
             chat_id=message.chat.id,
             message_id=update_info["message_id"],
-            text=build_task_detail_text(task),
+            text=build_task_detail_text(task, user_id),
             reply_markup=task_detail_kb(
                 task,
                 user_id,
@@ -2276,8 +2504,7 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Подтверждать выполнение может только автор", show_alert=True)
             return
 
-        participant = USERS.get(participant_id)
-        participant_name = participant.first_name if participant else "Неизвестный"
+        participant_name = get_user_full_name(participant_id)
 
         set_all_participants_status(task, TaskStatus.COMPLETED)
         task.completed_date = datetime.now()
