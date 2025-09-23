@@ -29,6 +29,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.fsm.context import FSMContext  # noqa: E402
 from aiogram.fsm.state import State, StatesGroup  # noqa: E402
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
 
 # Списки проектов и направлений
 PROJECTS = {
@@ -433,6 +434,97 @@ def create_dispatcher() -> Dispatcher:
     # Хранилище данных для создания задачи
     task_data = {}
 
+    async def safe_edit_message(message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+        """Безопасно редактирует сообщение, игнорируя отсутствие изменений."""
+
+        try:
+            await message.edit_text(text=text, reply_markup=reply_markup)
+        except TelegramBadRequest as error:
+            if "message is not modified" in error.message:
+                return
+            raise
+
+    async def safe_edit_message_by_id(
+        bot: Bot,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        """Редактирует сообщение по идентификатору с защитой от повторного текста."""
+
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" in error.message:
+                return
+            raise
+
+    def build_creation_header(data: dict) -> str:
+        """Формирует заголовок с текущими параметрами создаваемой задачи."""
+
+        lines: list[str] = ["📝 <b>Создание новой задачи</b>"]
+
+        title = data.get("title")
+        if title:
+            lines.append(f"📌 Название: {title}")
+
+        if "description" in data:
+            description = data.get("description") or "Не указано"
+            lines.append(f"📄 Описание: {description}")
+
+        if "due_date" in data:
+            due_date = data.get("due_date")
+            if isinstance(due_date, datetime):
+                lines.append(f"📅 Срок: {due_date.strftime('%d.%m.%Y')}")
+            else:
+                lines.append("📅 Срок: Не указан")
+
+        priority = data.get("priority")
+        if priority:
+            lines.append(f"⚡ Приоритет: {priority.value}")
+
+        project = data.get("project")
+        if project:
+            project_name = PROJECTS.get(project, project)
+            lines.append(f"🏢 Проект: {project_name}")
+
+        direction = data.get("direction")
+        if direction:
+            lines.append(f"🎯 Направление: {get_direction_label(direction)}")
+
+        responsible_users = data.get("responsible_users")
+        if responsible_users:
+            names = [
+                USERS[user_id].first_name
+                for user_id in responsible_users
+                if user_id in USERS
+            ]
+            if names:
+                lines.append(f"👤 Ответственный: {', '.join(names)}")
+
+        workgroup_users = data.get("workgroup_users")
+        if workgroup_users:
+            names = [
+                USERS[user_id].first_name
+                for user_id in workgroup_users
+                if user_id in USERS
+            ]
+            if names:
+                lines.append(f"👥 Рабочая группа: {', '.join(names)}")
+
+        if "is_private" in data:
+            is_private = data.get("is_private")
+            privacy_text = "Личная" if is_private else "Общая"
+            lines.append(f"🔒 Приватность: {privacy_text}")
+
+        return "\n".join(lines)
+
     @dispatcher.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
         """Обрабатывает команду /start с главным меню."""
@@ -462,7 +554,11 @@ def create_dispatcher() -> Dispatcher:
         list_type = "всех" if callback.data == "all_tasks" else "ваших"
         new_text = f"📊 Просмотр {list_type} задач. Выберите фильтр:"
         
-        await callback.message.edit_text(new_text, reply_markup=tasks_filter_kb())
+        await safe_edit_message(
+            callback.message,
+            text=new_text,
+            reply_markup=tasks_filter_kb(),
+        )
         await callback.answer()
 
     @dispatcher.callback_query(F.data == "add_task")
@@ -470,7 +566,7 @@ def create_dispatcher() -> Dispatcher:
         """Обрабатывает кнопку добавления задачи."""
         user_id = callback.from_user.id
         text = get_main_message(user_id)
-        
+
         if "Доступ ограничен" in text:
             await callback.answer("Доступ ограничен")
             return
@@ -481,15 +577,19 @@ def create_dispatcher() -> Dispatcher:
             'author_id': user_id,
             'created_date': datetime.now(),
             'responsible_users': set(),
-            'workgroup_users': set()
+            'workgroup_users': set(),
+            'message_id': callback.message.message_id,
         }
-        
-        await callback.message.edit_text(
-            "📝 <b>Создание новой задачи</b>\n\n"
-            "Введите название задачи:",
+
+        header = build_creation_header(task_data[user_id])
+        prompt = "Введите название задачи:"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task_creation")]]
-            )
+            ),
         )
         await callback.answer()
 
@@ -502,7 +602,11 @@ def create_dispatcher() -> Dispatcher:
             del task_data[user_id]
         
         text = get_main_message(user_id)
-        await callback.message.edit_text(text, reply_markup=main_menu_kb())
+        await safe_edit_message(
+            callback.message,
+            text=text,
+            reply_markup=main_menu_kb(),
+        )
         await callback.answer("Создание задачи отменено")
 
     @dispatcher.message(TaskCreation.waiting_for_title)
@@ -514,15 +618,23 @@ def create_dispatcher() -> Dispatcher:
             await message.answer("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
             return
         
-        task_data[user_id]['title'] = message.text
+        task_data[user_id]['title'] = message.text.strip()
         await state.set_state(TaskCreation.waiting_for_description)
-        
-        await message.answer(
-            "📄 Теперь введите описание задачи (или отправьте '-' чтобы пропустить):",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_title")]]
+
+        message_id = task_data[user_id].get('message_id')
+        if message_id:
+            header = build_creation_header(task_data[user_id])
+            prompt = "📄 Теперь введите описание задачи (или отправьте '-' чтобы пропустить):"
+            await safe_edit_message_by_id(
+                message.bot,
+                chat_id=message.chat.id,
+                message_id=message_id,
+                text=f"{header}\n\n{prompt}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_title")]]
+                ),
             )
-        )
+        await message.delete()
 
     @dispatcher.callback_query(F.data == "back_task_title")
     async def handle_back_title(callback: CallbackQuery, state: FSMContext) -> None:
@@ -530,11 +642,17 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         await state.set_state(TaskCreation.waiting_for_title)
         
-        await callback.message.edit_text(
-            "📝 Введите название задачи:",
+        task_info = task_data.get(user_id, {})
+        task_info.pop('title', None)
+        header = build_creation_header(task_info)
+        prompt = "Введите название задачи:"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task_creation")]]
-            )
+            ),
         )
         await callback.answer()
 
@@ -547,16 +665,24 @@ def create_dispatcher() -> Dispatcher:
             await message.answer("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
             return
         
-        description = message.text if message.text != '-' else ''
+        description = message.text.strip() if message.text != '-' else ''
         task_data[user_id]['description'] = description
         await state.set_state(TaskCreation.waiting_for_due_date)
-        
-        await message.answer(
-            "📅 Введите дату выполнения в формате ДД.ММ.ГГГГ (или отправьте '-' для автоматического расчета):",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_description")]]
+
+        message_id = task_data[user_id].get('message_id')
+        if message_id:
+            header = build_creation_header(task_data[user_id])
+            prompt = "📅 Введите дату выполнения в формате ДД.ММ.ГГГГ (или отправьте '-' для автоматического расчета):"
+            await safe_edit_message_by_id(
+                message.bot,
+                chat_id=message.chat.id,
+                message_id=message_id,
+                text=f"{header}\n\n{prompt}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_description")]]
+                ),
             )
-        )
+        await message.delete()
 
     @dispatcher.callback_query(F.data == "back_task_description")
     async def handle_back_description(callback: CallbackQuery, state: FSMContext) -> None:
@@ -564,11 +690,16 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         await state.set_state(TaskCreation.waiting_for_description)
         
-        await callback.message.edit_text(
-            "📄 Введите описание задачи (или отправьте '-' чтобы пропустить):",
+        task_info = task_data.get(user_id, {})
+        header = build_creation_header(task_info)
+        prompt = "📄 Введите описание задачи (или отправьте '-' чтобы пропустить):"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_title")]]
-            )
+            ),
         )
         await callback.answer()
 
@@ -591,10 +722,18 @@ def create_dispatcher() -> Dispatcher:
             task_data[user_id]['due_date'] = None  # Будет рассчитано после выбора приоритета
         
         await state.set_state(TaskCreation.waiting_for_priority)
-        await message.answer(
-            "⚡ Выберите приоритет задачи:",
-            reply_markup=priority_kb()
-        )
+        message_id = task_data[user_id].get('message_id')
+        if message_id:
+            header = build_creation_header(task_data[user_id])
+            prompt = "⚡ Выберите приоритет задачи:"
+            await safe_edit_message_by_id(
+                message.bot,
+                chat_id=message.chat.id,
+                message_id=message_id,
+                text=f"{header}\n\n{prompt}",
+                reply_markup=priority_kb(),
+            )
+        await message.delete()
 
     @dispatcher.callback_query(F.data.startswith("priority_"))
     async def handle_priority_selection(callback: CallbackQuery, state: FSMContext) -> None:
@@ -602,7 +741,11 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         priority_key = callback.data.replace("priority_", "")
@@ -620,9 +763,13 @@ def create_dispatcher() -> Dispatcher:
             task_data[user_id]['due_date'] = due_date
         
         await state.set_state(TaskCreation.waiting_for_project)
-        await callback.message.edit_text(
-            "🏢 Выберите проект:",
-            reply_markup=projects_kb()
+        header = build_creation_header(task_data[user_id])
+        prompt = "🏢 Выберите проект:"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=projects_kb(),
         )
         await callback.answer()
 
@@ -632,16 +779,24 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         project_id = callback.data.replace("project_", "")
         task_data[user_id]['project'] = project_id
         
         await state.set_state(TaskCreation.waiting_for_direction)
-        await callback.message.edit_text(
-            "🎯 Выберите направление:",
-            reply_markup=directions_kb()
+        header = build_creation_header(task_data[user_id])
+        prompt = "🎯 Выберите направление:"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=directions_kb(),
         )
         await callback.answer()
 
@@ -651,7 +806,11 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         direction_id = callback.data.replace("direction_", "")
@@ -662,9 +821,13 @@ def create_dispatcher() -> Dispatcher:
         users = get_users_by_direction(direction_id)
         
         await state.set_state(TaskCreation.waiting_for_responsible)
-        await callback.message.edit_text(
-            f"👤 Выберите ответственного за задачу (направление: {direction_name}):",
-            reply_markup=users_kb(users, set(), "responsible", "direction")
+        header = build_creation_header(task_data[user_id])
+        prompt = f"👤 Выберите ответственного за задачу (направление: {direction_name}):"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=users_kb(users, set(), "responsible", "direction"),
         )
         await callback.answer()
 
@@ -674,7 +837,11 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         selected_user_id = int(callback.data.replace("responsible_", ""))
@@ -690,10 +857,16 @@ def create_dispatcher() -> Dispatcher:
         direction_name = direction_title(direction_id)
         users = get_users_by_direction(direction_id)
         
-        await callback.message.edit_text(
-            f"👤 Выберите ответственного за задачу (направление: {direction_name}):\n",
-            f"✅ Выбрано: {len(selected_responsible)}",
-            reply_markup=users_kb(users, selected_responsible, "responsible", "direction")
+        header = build_creation_header(task_data[user_id])
+        prompt = (
+            f"👤 Выберите ответственного за задачу (направление: {direction_name}):\n"
+            f"✅ Выбрано: {len(selected_responsible)}"
+        )
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=users_kb(users, selected_responsible, "responsible", "direction"),
         )
         await callback.answer()
 
@@ -703,7 +876,11 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         if not task_data[user_id]['responsible_users']:
@@ -715,9 +892,13 @@ def create_dispatcher() -> Dispatcher:
         users = get_users_by_direction(direction_id)
         
         await state.set_state(TaskCreation.waiting_for_workgroup)
-        await callback.message.edit_text(
-            "👥 Выберите рабочую группу (можно выбрать несколько):",
-            reply_markup=users_kb(users, task_data[user_id]['workgroup_users'], "workgroup", "responsible")
+        header = build_creation_header(task_data[user_id])
+        prompt = "👥 Выберите рабочую группу (можно выбрать несколько):"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=users_kb(users, task_data[user_id]['workgroup_users'], "workgroup", "responsible"),
         )
         await callback.answer()
 
@@ -727,7 +908,11 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         selected_user_id = int(callback.data.replace("workgroup_", ""))
@@ -741,10 +926,16 @@ def create_dispatcher() -> Dispatcher:
         direction_name = direction_title(direction_id)
         users = get_users_by_direction(direction_id)
         
-        await callback.message.edit_text(
-            "👥 Выберите рабочую группу (можно выбрать несколько):\n",
-            f"✅ Выбрано: {len(task_data[user_id]['workgroup_users'])}",
-            reply_markup=users_kb(users, task_data[user_id]['workgroup_users'], "workgroup", "responsible")
+        header = build_creation_header(task_data[user_id])
+        prompt = (
+            "👥 Выберите рабочую группу (можно выбрать несколько):\n"
+            f"✅ Выбрано: {len(task_data[user_id]['workgroup_users'])}"
+        )
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=users_kb(users, task_data[user_id]['workgroup_users'], "workgroup", "responsible"),
         )
         await callback.answer()
 
@@ -754,13 +945,21 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         await state.set_state(TaskCreation.waiting_for_privacy)
-        await callback.message.edit_text(
-            "🔒 Выберите уровень доступа к задаче:",
-            reply_markup=privacy_kb()
+        header = build_creation_header(task_data[user_id])
+        prompt = "🔒 Выберите уровень доступа к задаче:"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=privacy_kb(),
         )
         await callback.answer()
 
@@ -770,7 +969,11 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         if user_id not in task_data:
             await state.clear()
-            await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
             return
         
         privacy = callback.data.replace("privacy_", "")
@@ -822,16 +1025,20 @@ def create_dispatcher() -> Dispatcher:
                     LOGGER.error(f"Ошибка отправки уведомления пользователю {notified_user_id}: {e}")
 
             # Сообщение автору
-            await callback.message.edit_text(
-                "✅ <b>Задача успешно создана!</b>\n\n",
-                f"📝 <b>{task.title}</b>\n",
-                f"📄 Описание: {task.description or 'Не указано'}\n",
-                f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n",
-                f"⚡ Приоритет: {task.priority.value}\n",
-                f"🏢 Проект: {PROJECTS[task.project]}\n",
-                f"🎯 Направление: {get_direction_label(task.direction)}\n",
-                f"👥 Участников: {len(all_notified_users)}",
-                reply_markup=main_menu_kb()
+            success_text = (
+                "✅ <b>Задача успешно создана!</b>\n\n"
+                f"📝 <b>{task.title}</b>\n"
+                f"📄 Описание: {task.description or 'Не указано'}\n"
+                f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n"
+                f"⚡ Приоритет: {task.priority.value}\n"
+                f"🏢 Проект: {PROJECTS[task.project]}\n"
+                f"🎯 Направление: {get_direction_label(task.direction)}\n"
+                f"👥 Участников: {len(all_notified_users)}"
+            )
+            await safe_edit_message(
+                callback.message,
+                text=success_text,
+                reply_markup=main_menu_kb(),
             )
 
 
@@ -841,11 +1048,15 @@ def create_dispatcher() -> Dispatcher:
             
         except Exception as e:
             LOGGER.error(f"Ошибка создания задачи: {e}")
-            await callback.message.edit_text(
+            error_text = (
                 "❌ <b>Ошибка создания задачи!</b>\n\n"
                 f"Произошла ошибка: {str(e)}\n\n"
-                "Попробуйте создать задачу заново.",
-                reply_markup=main_menu_kb()
+                "Попробуйте создать задачу заново."
+            )
+            await safe_edit_message(
+                callback.message,
+                text=error_text,
+                reply_markup=main_menu_kb(),
             )
             if user_id in task_data:
                 del task_data[user_id]
@@ -862,24 +1073,38 @@ def create_dispatcher() -> Dispatcher:
         
         if back_to == "main":
             text = get_main_message(user_id)
-            await callback.message.edit_text(text, reply_markup=main_menu_kb())
-        
+            await safe_edit_message(
+                callback.message,
+                text=text,
+                reply_markup=main_menu_kb(),
+            )
+
         elif back_to == "help":
-            await callback.message.edit_text(get_help_text(user_id), reply_markup=help_menu_kb())
+            await safe_edit_message(
+                callback.message,
+                text=get_help_text(user_id),
+                reply_markup=help_menu_kb(),
+            )
         
         elif back_to == "task_creation":
             # Возврат к началу создания задачи
-            if user_id in task_data:
-                del task_data[user_id]
-            await state.clear()
-            await callback.message.edit_text(
-                "📝 <b>Создание новой задачи</b>\n\n"
-                "Введите название задачи:",
+            task_data[user_id] = {
+                'author_id': user_id,
+                'created_date': datetime.now(),
+                'responsible_users': set(),
+                'workgroup_users': set(),
+                'message_id': callback.message.message_id,
+            }
+            await state.set_state(TaskCreation.waiting_for_title)
+            header = build_creation_header(task_data[user_id])
+            prompt = "Введите название задачи:"
+            await safe_edit_message(
+                callback.message,
+                text=f"{header}\n\n{prompt}",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task_creation")]]
-                )
+                ),
             )
-            await state.set_state(TaskCreation.waiting_for_title)
         
         await callback.answer()
 
@@ -888,7 +1113,11 @@ def create_dispatcher() -> Dispatcher:
     async def handle_help(callback: CallbackQuery, state: FSMContext) -> None:
         """Обрабатывает кнопку помощи."""
         user_id = callback.from_user.id
-        await callback.message.edit_text(get_help_text(user_id), reply_markup=help_menu_kb())
+        await safe_edit_message(
+            callback.message,
+            text=get_help_text(user_id),
+            reply_markup=help_menu_kb(),
+        )
         await callback.answer()
 
     @dispatcher.callback_query(F.data.startswith("help_"))
@@ -900,17 +1129,37 @@ def create_dispatcher() -> Dispatcher:
         if section in ["help_tasks", "help_statuses"]:
             text = get_help_section_text(section, user_id)
             if section == "help_tasks":
-                await callback.message.edit_text(text, reply_markup=help_tasks_kb())
+                await safe_edit_message(
+                    callback.message,
+                    text=text,
+                    reply_markup=help_tasks_kb(),
+                )
             else:
-                await callback.message.edit_text(text, reply_markup=help_statuses_kb())
+                await safe_edit_message(
+                    callback.message,
+                    text=text,
+                    reply_markup=help_statuses_kb(),
+                )
         else:
             text = get_help_section_text(section, user_id)
             if section == "help_add_tasks":
-                await callback.message.edit_text(text, reply_markup=back_button_kb("help_tasks"))
+                await safe_edit_message(
+                    callback.message,
+                    text=text,
+                    reply_markup=back_button_kb("help_tasks"),
+                )
             elif section in ["help_filter", "help_by_status", "help_by_priority"]:
-                await callback.message.edit_text(text, reply_markup=back_button_kb("help_tasks" if section == "help_filter" else "help_statuses"))
+                await safe_edit_message(
+                    callback.message,
+                    text=text,
+                    reply_markup=back_button_kb("help_tasks" if section == "help_filter" else "help_statuses"),
+                )
             else:
-                await callback.message.edit_text(text, reply_markup=back_button_kb("help"))
+                await safe_edit_message(
+                    callback.message,
+                    text=text,
+                    reply_markup=back_button_kb("help"),
+                )
         
         await callback.answer()
 
@@ -937,10 +1186,14 @@ def create_dispatcher() -> Dispatcher:
             filter_text = "все"
         
         if not tasks:
-            await callback.message.edit_text(
+            empty_text = (
                 f"📋 <b>{filter_text.capitalize()} задачи</b>\n\n"
-                "Задачи не найдены.",
-                reply_markup=tasks_filter_kb("main" if "ваших" in callback.message.text else "all")
+                "Задачи не найдены."
+            )
+            await safe_edit_message(
+                callback.message,
+                text=empty_text,
+                reply_markup=tasks_filter_kb("main" if "ваших" in callback.message.text else "all"),
             )
             await callback.answer()
             return
@@ -973,9 +1226,10 @@ def create_dispatcher() -> Dispatcher:
         if len(tasks) > 10:
             tasks_text += f"\n... и еще {len(tasks) - 10} задач"
         
-        await callback.message.edit_text(
-            tasks_text,
-            reply_markup=tasks_filter_kb("main" if "ваших" in callback.message.text else "all")
+        await safe_edit_message(
+            callback.message,
+            text=tasks_text,
+            reply_markup=tasks_filter_kb("main" if "ваших" in callback.message.text else "all"),
         )
         await callback.answer()
 
@@ -988,13 +1242,17 @@ def create_dispatcher() -> Dispatcher:
         if task_id in TASKS:
             task = TASKS[task_id]
             task.status = TaskStatus.ACTIVE
-            
-            await callback.message.edit_text(
-                f"✅ <b>Задача взята в работу!</b>\n\n"
+
+            taken_text = (
+                "✅ <b>Задача взята в работу!</b>\n\n"
                 f"📝 <b>{task.title}</b>\n"
-                f"🔄 Статус: В работе\n"
-                f"👤 Ответственный: {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}",
-                reply_markup=main_menu_kb()
+                "🔄 Статус: В работе\n"
+                f"👤 Ответственный: {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}"
+            )
+            await safe_edit_message(
+                callback.message,
+                text=taken_text,
+                reply_markup=main_menu_kb(),
             )
         else:
             await callback.answer("❌ Задача не найдена!")
@@ -1009,13 +1267,17 @@ def create_dispatcher() -> Dispatcher:
         if task_id in TASKS:
             task = TASKS[task_id]
             task.status = TaskStatus.PAUSED
-            
-            await callback.message.edit_text(
-                f"⏸️ <b>Задача приостановлена</b>\n\n"
+
+            paused_text = (
+                "⏸️ <b>Задача приостановлена</b>\n\n"
                 f"📝 <b>{task.title}</b>\n"
-                f"⏸️ Статус: На паузе\n"
-                f"👤 Ответственный: {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}",
-                reply_markup=main_menu_kb()
+                "⏸️ Статус: На паузе\n"
+                f"👤 Ответственный: {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}"
+            )
+            await safe_edit_message(
+                callback.message,
+                text=paused_text,
+                reply_markup=main_menu_kb(),
             )
         else:
             await callback.answer("❌ Задача не найдена!")
