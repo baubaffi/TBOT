@@ -501,6 +501,50 @@ async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_d
             )
 
 
+def build_reminder_keyboard(task: Task, recipient_id: int) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру действий для напоминания по задаче."""
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    context = f"{task.task_id}:notify:all:1"
+
+    # Кнопка открытия подробной карточки задачи
+    buttons.append([
+        InlineKeyboardButton(
+            text="📂 Открыть задачу",
+            callback_data=f"task_detail:{context}",
+        )
+    ])
+
+    role = detect_user_role(task, recipient_id)
+    participant_status = get_participant_status(task, recipient_id)
+
+    # Кнопку «Взять в работу» показываем только тем, кто может начать выполнение
+    can_take = (
+        role != "author"
+        and task.status != TaskStatus.COMPLETED
+        and not task.awaiting_author_confirmation
+        and participant_status != TaskStatus.COMPLETED
+    )
+    if can_take:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔄 Взять в работу",
+                callback_data=f"take_task:{context}",
+            )
+        ])
+
+    # Возможность переноса срока доступна автору, ответственному и рабочей группе
+    if role in {"author", "responsible", "workgroup"}:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🕒 Отложить",
+                callback_data=f"postpone_task:{context}",
+            )
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 async def send_task_reminder(
     bot: Bot,
     task: Task,
@@ -526,7 +570,12 @@ async def send_task_reminder(
         if user is None:
             continue
         try:
-            await bot.send_message(chat_id=recipient_id, text=reminder_text)
+            reminder_keyboard = build_reminder_keyboard(task, recipient_id)
+            await bot.send_message(
+                chat_id=recipient_id,
+                text=reminder_text,
+                reply_markup=reminder_keyboard,
+            )
         except Exception as error:
             LOGGER.error(
                 "Не удалось отправить напоминание пользователю %s: %s",
@@ -2511,27 +2560,43 @@ def create_dispatcher() -> Dispatcher:
 
         participant_name = get_user_full_name(participant_id)
 
-        set_all_participants_status(task, TaskStatus.COMPLETED)
-        task.completed_date = datetime.now()
-        task.current_executor_id = None
-        task.status_before_overdue = None
-        clear_pending_confirmations(task)
+        set_participant_status(task, participant_id, TaskStatus.COMPLETED)
+        if task.current_executor_id == participant_id:
+            task.current_executor_id = None
+
+        remove_pending_confirmation(task, participant_id)
+
+        participants = [
+            member_id
+            for member_id in get_task_participants(task)
+            if member_id != task.author_id
+        ]
+        all_completed = all(
+            get_participant_status(task, member_id) == TaskStatus.COMPLETED
+            for member_id in participants
+        )
+
+        if all_completed and participants:
+            task.completed_date = datetime.now()
+            task.status_before_overdue = None
+        elif not all_completed:
+            task.completed_date = None
 
         record_task_action(
             task,
             user_id,
-            f"Подтвердил выполнение задачи ({participant_name})",
+            f"Подтвердил выполнение участника {participant_name}",
         )
 
         await notify_task_participants(
             callback.bot,
             task,
             user_id,
-            "подтвердил(а) выполнение задачи.",
+            f"подтвердил(а) выполнение участника {participant_name}.",
         )
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
-        await callback.answer("Выполнение подтверждено")
+        await callback.answer(f"Подтверждено: {participant_name}")
 
     @dispatcher.callback_query(F.data.startswith("return_task"))
     async def handle_return_task(callback: CallbackQuery, state: FSMContext) -> None:
