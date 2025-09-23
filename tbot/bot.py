@@ -17,13 +17,21 @@ from .tasks import (
     TaskPriority,
     TaskStatus,
     TASKS,
+    add_pending_confirmation,
+    clear_pending_confirmations,
     create_task,
     delete_task as remove_task,
     get_involved_tasks,
+    get_participant_status,
+    get_task_participants,
     is_user_involved,
     record_task_action,
+    recalc_task_status,
     refresh_all_tasks_statuses,
     refresh_task_status,
+    remove_pending_confirmation,
+    set_all_participants_status,
+    set_participant_status,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -324,14 +332,16 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
 
     buttons: list[list[InlineKeyboardButton]] = []
     context = f"{task.task_id}:{view}:{filter_type}:{page}"
-    can_manage = viewer_id in {
-        task.current_executor_id,
-        task.responsible_user_id,
-        task.author_id,
-    }
+    is_author = viewer_id == task.author_id
+    is_responsible = viewer_id == task.responsible_user_id
+    in_workgroup = viewer_id in task.workgroup
+    is_current_executor = task.current_executor_id == viewer_id
+    awaiting_confirmation = task.awaiting_author_confirmation
 
-    if task.status != TaskStatus.COMPLETED:
-        if task.current_executor_id == viewer_id:
+    show_controls = task.status != TaskStatus.COMPLETED or awaiting_confirmation
+
+    if show_controls:
+        if is_current_executor:
             buttons.append([
                 InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete_task:{context}"),
                 InlineKeyboardButton(text="⏸️ Пауза", callback_data=f"pause_task:{context}"),
@@ -341,19 +351,52 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
                 InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_task:{context}"),
             ])
         else:
-            buttons.append([
-                InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
-            ])
-            if can_manage:
+            if not is_author and not awaiting_confirmation:
                 buttons.append([
-                    InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}"),
-                    InlineKeyboardButton(text="⏸️ Пауза", callback_data=f"pause_task:{context}"),
+                    InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
                 ])
+
+            management_row: list[InlineKeyboardButton] = []
+
+            if is_author or is_responsible:
+                management_row.append(
+                    InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}")
+                )
+                management_row.append(
+                    InlineKeyboardButton(text="⏸️ Пауза", callback_data=f"pause_task:{context}")
+                )
+            elif in_workgroup:
+                management_row.append(
+                    InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}")
+                )
+
+            if management_row:
+                buttons.append(management_row)
+
+            if (is_author or is_responsible) and not is_current_executor:
                 buttons.append([
                     InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_task:{context}"),
                 ])
 
-    if task.author_id == viewer_id:
+    if is_author and task.pending_confirmations:
+        for participant_id in sorted(task.pending_confirmations):
+            user = USERS.get(participant_id)
+            participant_name = user.first_name if user else "Неизвестный"
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"✅ Подтвердить: {participant_name}",
+                    callback_data=(
+                        f"confirm_completion:{task.task_id}:{participant_id}:{view}:{filter_type}:{page}"
+                    ),
+                )
+            ])
+
+    if is_author and (task.status == TaskStatus.COMPLETED or task.awaiting_author_confirmation):
+        buttons.append([
+            InlineKeyboardButton(text="🔄 Вернуть в работу", callback_data=f"return_task:{context}"),
+        ])
+
+    if is_author:
         buttons.append([
             InlineKeyboardButton(
                 text="🗑️ Удалить/Отменить задачу",
@@ -447,6 +490,37 @@ def build_task_detail_text(task: Task) -> str:
 
     if executor_name:
         lines.append(f"👷 Исполнитель: {executor_name}")
+
+    participant_lines: list[str] = []
+    for participant_id in sorted(get_task_participants(task)):
+        user = USERS.get(participant_id)
+        participant_name = user.first_name if user else "Неизвестный"
+        if participant_id == task.author_id:
+            role_label = "Автор"
+        elif participant_id == task.responsible_user_id:
+            role_label = "Ответственный"
+        else:
+            role_label = "Рабочая группа"
+        participant_status = get_participant_status(task, participant_id).value
+        marker = ""
+        if participant_id in task.pending_confirmations:
+            marker = " (ожидает подтверждения)"
+        participant_lines.append(
+            f"   • {participant_name} ({role_label}) — {participant_status}{marker}"
+        )
+
+    if participant_lines:
+        lines.append("👥 Статусы участников:")
+        lines.extend(participant_lines)
+
+    if task.awaiting_author_confirmation and task.pending_confirmations:
+        pending_names = [
+            USERS.get(participant_id).first_name
+            if USERS.get(participant_id)
+            else "Неизвестный"
+            for participant_id in task.pending_confirmations
+        ]
+        lines.append(f"📨 На подтверждении: {', '.join(pending_names)}")
 
     if task.last_action and task.last_actor_id:
         actor = USERS.get(task.last_actor_id)
@@ -689,7 +763,7 @@ def create_dispatcher() -> Dispatcher:
             raise
 
     async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_description: str) -> None:
-        """Отправляет уведомление автору и ответственному о действии по задаче."""
+        """Отправляет уведомление всем участникам о действии по задаче."""
 
         actor = USERS.get(actor_id)
         actor_name = actor.first_name if actor else "Неизвестный пользователь"
@@ -699,7 +773,7 @@ def create_dispatcher() -> Dispatcher:
             f"👤 {actor_name} {action_description}"
         )
 
-        recipients = {task.author_id, task.responsible_user_id}
+        recipients = set(get_task_participants(task))
 
         for recipient_id in recipients:
             user = USERS.get(recipient_id)
@@ -713,6 +787,17 @@ def create_dispatcher() -> Dispatcher:
                     recipient_id,
                     error,
                 )
+
+    def detect_user_role(task: Task, user_id: int) -> str:
+        """Определяет роль пользователя в задаче."""
+
+        if user_id == task.author_id:
+            return "author"
+        if user_id == task.responsible_user_id:
+            return "responsible"
+        if user_id in task.workgroup:
+            return "workgroup"
+        return "viewer"
 
     def build_creation_header(data: dict) -> str:
         """Формирует заголовок с текущими параметрами создаваемой задачи."""
@@ -1816,6 +1901,25 @@ def create_dispatcher() -> Dispatcher:
 
         return task, view, filter_type, page
 
+    def extract_confirmation_context(callback_data: str) -> tuple[int, int, str, str, int]:
+        """Получает параметры для подтверждения выполнения."""
+
+        default_context = (0, 0, "notify", "all", 1)
+
+        if callback_data.startswith("confirm_completion:"):
+            parts = callback_data.split(":", 5)
+            if len(parts) == 6:
+                _, task_id_str, participant_id_str, view, filter_type, page_str = parts
+                try:
+                    task_id = int(task_id_str)
+                    participant_id = int(participant_id_str)
+                    page = int(page_str)
+                except ValueError:
+                    return default_context
+                return task_id, participant_id, view, filter_type, page
+
+        return default_context
+
     def can_manage_task(task: Task, user_id: int) -> bool:
         """Проверяет, может ли пользователь управлять задачей."""
 
@@ -1838,10 +1942,19 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Эта задача вам недоступна", show_alert=True)
             return
 
+        if user_id == task.author_id:
+            await callback.answer("Автор не может брать задачу в работу", show_alert=True)
+            return
+        if task.awaiting_author_confirmation:
+            await callback.answer("Ожидается подтверждение автора", show_alert=True)
+            return
+
         task.current_executor_id = user_id
-        task.status = TaskStatus.ACTIVE
+        set_participant_status(task, user_id, TaskStatus.ACTIVE)
+        remove_pending_confirmation(task, user_id)
         task.completed_date = None
         task.status_before_overdue = None
+        recalc_task_status(task)
         record_task_action(task, user_id, "Взял задачу в работу")
         await notify_task_participants(
             callback.bot,
@@ -1866,8 +1979,17 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Нет прав для изменения задачи", show_alert=True)
             return
 
-        task.status = TaskStatus.PAUSED
+        role = detect_user_role(task, user_id)
+        if role in {"author", "responsible"}:
+            set_all_participants_status(task, TaskStatus.PAUSED)
+            task.current_executor_id = None
+        else:
+            set_participant_status(task, user_id, TaskStatus.PAUSED)
+            if task.current_executor_id == user_id:
+                task.current_executor_id = None
+
         task.status_before_overdue = None
+        recalc_task_status(task)
         record_task_action(task, user_id, "Поставил задачу на паузу")
         await notify_task_participants(
             callback.bot,
@@ -1892,14 +2014,36 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Нет прав для завершения", show_alert=True)
             return
 
-        task.status = TaskStatus.COMPLETED
-        task.completed_date = datetime.now()
-        task.current_executor_id = user_id
+        role = detect_user_role(task, user_id)
+        if role == "author":
+            await callback.answer("Автор подтверждает выполнение из карточки", show_alert=True)
+            return
+
+        set_participant_status(task, user_id, TaskStatus.COMPLETED)
+        if task.current_executor_id == user_id:
+            task.current_executor_id = None
+        task.completed_date = None
         task.status_before_overdue = None
-        record_task_action(task, user_id, "Завершил задачу")
+
+        add_pending_confirmation(task, user_id)
+
+        if role == "responsible":
+            action_note = "завершил(а) задачу и отправил(а) на подтверждение автору."
+            answer_text = "Задача передана на подтверждение автору"
+        else:
+            action_note = "завершил(а) свою часть задачи и отправил(а) на проверку."
+            answer_text = "Результат отправлен на проверку ответственному"
+
+        record_task_action(task, user_id, "Завершил задачу для проверки")
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            action_note,
+        )
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
-        await callback.answer("Задача завершена")
+        await callback.answer(answer_text)
 
     @dispatcher.callback_query(F.data.startswith("cancel_task"))
     async def handle_cancel_task_action(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1914,10 +2058,21 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Нет прав для отмены", show_alert=True)
             return
 
-        task.status = TaskStatus.NEW
-        task.current_executor_id = None
-        task.completed_date = None
-        task.status_before_overdue = None
+        role = detect_user_role(task, user_id)
+        if role in {"author", "responsible"}:
+            set_all_participants_status(task, TaskStatus.NEW)
+            task.current_executor_id = None
+            task.completed_date = None
+            task.status_before_overdue = None
+            clear_pending_confirmations(task)
+        else:
+            set_participant_status(task, user_id, TaskStatus.NEW)
+            if task.current_executor_id == user_id:
+                task.current_executor_id = None
+            task.completed_date = None
+            task.status_before_overdue = None
+            remove_pending_confirmation(task, user_id)
+            recalc_task_status(task)
         record_task_action(task, user_id, "Отменил выполнение задачи")
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
@@ -1932,7 +2087,7 @@ def create_dispatcher() -> Dispatcher:
             return
 
         user_id = callback.from_user.id
-        if not can_manage_task(task, user_id):
+        if not (can_manage_task(task, user_id) or user_id in task.workgroup):
             await callback.answer("Нет прав для изменения срока", show_alert=True)
             return
 
@@ -2049,7 +2204,16 @@ def create_dispatcher() -> Dispatcher:
         new_due_date = update_info["new_due_date"]
         task.due_date = new_due_date
         task.status_before_overdue = None
-        task.status = TaskStatus.PAUSED
+
+        role = detect_user_role(task, user_id)
+        if role in {"author", "responsible"}:
+            recalc_task_status(task)
+        else:
+            set_participant_status(task, user_id, TaskStatus.PAUSED)
+            if task.current_executor_id == user_id:
+                task.current_executor_id = None
+            recalc_task_status(task)
+
         record_task_action(
             task,
             user_id,
@@ -2086,6 +2250,77 @@ def create_dispatcher() -> Dispatcher:
         )
 
         await message.delete()
+
+    @dispatcher.callback_query(F.data.startswith("confirm_completion:"))
+    async def handle_confirm_completion(callback: CallbackQuery, state: FSMContext) -> None:
+        """Подтверждает выполнение задачи автором."""
+
+        task_id, participant_id, view, filter_type, page = extract_confirmation_context(callback.data)
+        task = TASKS.get(task_id)
+
+        if not task:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+
+        user_id = callback.from_user.id
+        if user_id != task.author_id:
+            await callback.answer("Подтверждать выполнение может только автор", show_alert=True)
+            return
+
+        participant = USERS.get(participant_id)
+        participant_name = participant.first_name if participant else "Неизвестный"
+
+        set_all_participants_status(task, TaskStatus.COMPLETED)
+        task.completed_date = datetime.now()
+        task.current_executor_id = None
+        task.status_before_overdue = None
+        clear_pending_confirmations(task)
+
+        record_task_action(
+            task,
+            user_id,
+            f"Подтвердил выполнение задачи ({participant_name})",
+        )
+
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            "подтвердил(а) выполнение задачи.",
+        )
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Выполнение подтверждено")
+
+    @dispatcher.callback_query(F.data.startswith("return_task"))
+    async def handle_return_task(callback: CallbackQuery, state: FSMContext) -> None:
+        """Возвращает задачу в работу по решению автора."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "return_task")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if user_id != task.author_id:
+            await callback.answer("Вернуть задачу может только автор", show_alert=True)
+            return
+
+        set_all_participants_status(task, TaskStatus.NEW)
+        task.current_executor_id = None
+        task.completed_date = None
+        task.status_before_overdue = None
+        clear_pending_confirmations(task)
+
+        record_task_action(task, user_id, "Вернул задачу в работу")
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            "вернул(а) задачу в работу.",
+        )
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Задача возвращена в работу")
 
     return dispatcher
 
