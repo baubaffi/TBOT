@@ -1889,6 +1889,7 @@ def create_dispatcher() -> Dispatcher:
     async def ensure_task_for_action(
         callback: CallbackQuery,
         prefix: str,
+        not_found_message: str = "Задача не найдена",
     ) -> tuple[Task | None, str, str, int]:
         """Возвращает задачу и параметры отображения для действия."""
 
@@ -1896,7 +1897,7 @@ def create_dispatcher() -> Dispatcher:
         task = TASKS.get(task_id)
 
         if not task:
-            await callback.answer("Задача не найдена", show_alert=True)
+            await callback.answer(not_found_message, show_alert=True)
             return None, view, filter_type, page
 
         return task, view, filter_type, page
@@ -1933,7 +1934,11 @@ def create_dispatcher() -> Dispatcher:
     async def handle_take_task(callback: CallbackQuery, state: FSMContext) -> None:
         """Обрабатывает взятие задачи в работу."""
 
-        task, view, filter_type, page = await ensure_task_for_action(callback, "take_task")
+        task, view, filter_type, page = await ensure_task_for_action(
+            callback,
+            "take_task",
+            "Задача уже завершена или удалена",
+        )
         if task is None:
             return
 
@@ -1947,6 +1952,10 @@ def create_dispatcher() -> Dispatcher:
             return
         if task.awaiting_author_confirmation:
             await callback.answer("Ожидается подтверждение автора", show_alert=True)
+            return
+
+        if task.status == TaskStatus.COMPLETED:
+            await callback.answer("Задача уже завершена или удалена", show_alert=True)
             return
 
         task.current_executor_id = user_id
