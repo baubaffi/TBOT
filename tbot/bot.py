@@ -91,6 +91,7 @@ class TaskCreation(StatesGroup):
 
 class TaskUpdate(StatesGroup):
     waiting_for_postpone_date = State()
+    waiting_for_postpone_reason = State()
 
 
 @dataclass(slots=True)
@@ -278,7 +279,7 @@ def privacy_kb():
                 InlineKeyboardButton(text="🌐 Публичная", callback_data="privacy_public"),
             ],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_creation"),
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="back_workgroup"),
             ]
         ]
     )
@@ -323,6 +324,11 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
 
     buttons: list[list[InlineKeyboardButton]] = []
     context = f"{task.task_id}:{view}:{filter_type}:{page}"
+    can_manage = viewer_id in {
+        task.current_executor_id,
+        task.responsible_user_id,
+        task.author_id,
+    }
 
     if task.status != TaskStatus.COMPLETED:
         if task.current_executor_id == viewer_id:
@@ -338,6 +344,14 @@ def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page
             buttons.append([
                 InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
             ])
+            if can_manage:
+                buttons.append([
+                    InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}"),
+                    InlineKeyboardButton(text="⏸️ Пауза", callback_data=f"pause_task:{context}"),
+                ])
+                buttons.append([
+                    InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_task:{context}"),
+                ])
 
     if task.author_id == viewer_id:
         buttons.append([
@@ -456,6 +470,7 @@ def task_actions_kb(task_id: int):
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
+                InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}"),
             ],
             [
                 InlineKeyboardButton(text="🏠 Главная", callback_data="back_main"),
@@ -672,6 +687,32 @@ def create_dispatcher() -> Dispatcher:
             if "message is not modified" in error.message:
                 return
             raise
+
+    async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_description: str) -> None:
+        """Отправляет уведомление автору и ответственному о действии по задаче."""
+
+        actor = USERS.get(actor_id)
+        actor_name = actor.first_name if actor else "Неизвестный пользователь"
+        notification_text = (
+            "ℹ️ <b>Изменение по задаче</b>\n\n"
+            f"📝 <b>{task.title}</b>\n"
+            f"👤 {actor_name} {action_description}"
+        )
+
+        recipients = {task.author_id, task.responsible_user_id}
+
+        for recipient_id in recipients:
+            user = USERS.get(recipient_id)
+            if user is None:
+                continue
+            try:
+                await bot.send_message(chat_id=recipient_id, text=notification_text)
+            except Exception as error:
+                LOGGER.error(
+                    "Не удалось отправить уведомление пользователю %s: %s",
+                    recipient_id,
+                    error,
+                )
 
     def build_creation_header(data: dict) -> str:
         """Формирует заголовок с текущими параметрами создаваемой задачи."""
@@ -1311,6 +1352,8 @@ def create_dispatcher() -> Dispatcher:
         user_id = callback.from_user.id
         
         if back_to == "main":
+            await state.clear()
+            task_updates.pop(user_id, None)
             text = get_main_message(user_id)
             await safe_edit_message(
                 callback.message,
@@ -1324,7 +1367,21 @@ def create_dispatcher() -> Dispatcher:
                 text=get_help_text(user_id),
                 reply_markup=help_menu_kb(),
             )
-        
+
+        elif back_to == "help_tasks":
+            await safe_edit_message(
+                callback.message,
+                text=get_help_section_text("help_tasks", user_id),
+                reply_markup=help_tasks_kb(),
+            )
+
+        elif back_to == "help_statuses":
+            await safe_edit_message(
+                callback.message,
+                text=get_help_section_text("help_statuses", user_id),
+                reply_markup=help_statuses_kb(),
+            )
+
         elif back_to == "task_creation":
             # Возврат к началу создания задачи
             task_data[user_id] = {
@@ -1344,7 +1401,91 @@ def create_dispatcher() -> Dispatcher:
                     inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task_creation")]]
                 ),
             )
-        
+
+        elif back_to in {"direction", "responsible", "workgroup"}:
+            task_info = task_data.get(user_id)
+            if not task_info:
+                await state.clear()
+                await safe_edit_message(
+                    callback.message,
+                    text="Сессия создания задачи устарела. Начните заново.",
+                    reply_markup=main_menu_kb(),
+                )
+                await callback.answer("Сессия создания задачи устарела", show_alert=True)
+                return
+
+            if back_to == "direction":
+                task_info.pop('direction', None)
+                responsible = task_info.get('responsible_users')
+                if isinstance(responsible, set):
+                    responsible.clear()
+                else:
+                    task_info['responsible_users'] = set()
+                workgroup = task_info.get('workgroup_users')
+                if isinstance(workgroup, set):
+                    workgroup.clear()
+                else:
+                    task_info['workgroup_users'] = set()
+
+                await state.set_state(TaskCreation.waiting_for_direction)
+                header = build_creation_header(task_info)
+                prompt = "🎯 Выберите направление:"
+                await safe_edit_message(
+                    callback.message,
+                    text=f"{header}\n\n{prompt}",
+                    reply_markup=directions_kb(),
+                )
+
+            elif back_to == "responsible":
+                direction_id = task_info.get('direction')
+                if not direction_id:
+                    await callback.answer("Сначала выберите направление", show_alert=True)
+                    return
+
+                workgroup = task_info.get('workgroup_users')
+                if isinstance(workgroup, set):
+                    workgroup.clear()
+                else:
+                    task_info['workgroup_users'] = set()
+
+                await state.set_state(TaskCreation.waiting_for_responsible)
+                header = build_creation_header(task_info)
+                direction_name = direction_title(direction_id)
+                prompt = f"👤 Выберите ответственного за задачу (направление: {direction_name}):"
+                users = get_users_by_direction(direction_id)
+                selected_responsible = task_info.get('responsible_users')
+                if not isinstance(selected_responsible, set):
+                    selected_responsible = set()
+                    task_info['responsible_users'] = selected_responsible
+
+                await safe_edit_message(
+                    callback.message,
+                    text=f"{header}\n\n{prompt}",
+                    reply_markup=users_kb(users, selected_responsible, "responsible", "direction"),
+                )
+
+            else:  # back_to == "workgroup"
+                direction_id = task_info.get('direction')
+                responsible = task_info.get('responsible_users')
+                if not direction_id or not responsible:
+                    await callback.answer("Сначала выберите ответственного", show_alert=True)
+                    return
+
+                await state.set_state(TaskCreation.waiting_for_workgroup)
+                header = build_creation_header(task_info)
+                prompt = "👥 Выберите рабочую группу (можно выбрать несколько):"
+                users = get_users_by_direction(direction_id)
+                workgroup = task_info.get('workgroup_users')
+                if not isinstance(workgroup, set):
+                    workgroup = set()
+                    task_info['workgroup_users'] = workgroup
+
+                await safe_edit_message(
+                    callback.message,
+                    text=f"{header}\n\n{prompt}",
+                    reply_markup=users_kb(users, workgroup, "workgroup", "responsible"),
+                )
+
         await callback.answer()
 
     # Обработчики помощи
@@ -1702,6 +1843,12 @@ def create_dispatcher() -> Dispatcher:
         task.completed_date = None
         task.status_before_overdue = None
         record_task_action(task, user_id, "Взял задачу в работу")
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            "взял(а) задачу в работу.",
+        )
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
         await callback.answer("Задача взята в работу")
@@ -1722,6 +1869,12 @@ def create_dispatcher() -> Dispatcher:
         task.status = TaskStatus.PAUSED
         task.status_before_overdue = None
         record_task_action(task, user_id, "Поставил задачу на паузу")
+        await notify_task_participants(
+            callback.bot,
+            task,
+            user_id,
+            "поставил(а) задачу на паузу.",
+        )
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
         await callback.answer("Задача на паузе")
@@ -1833,6 +1986,58 @@ def create_dispatcher() -> Dispatcher:
             await message.delete()
             return
 
+        update_info["new_due_date"] = new_due_date
+        await state.set_state(TaskUpdate.waiting_for_postpone_reason)
+
+        prompt = (
+            "🕒 Новый срок: "
+            f"{new_due_date.strftime('%d.%m.%Y')}\n"
+            "💬 Укажите причину переноса задачи:"
+        )
+
+        await safe_edit_message_by_id(
+            message.bot,
+            chat_id=message.chat.id,
+            message_id=update_info["message_id"],
+            text=prompt,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data=(
+                                f"back_task_detail:{update_info['task_id']}:{update_info['view']}"
+                                f":{update_info['filter']}:{update_info['page']}"
+                            ),
+                        )
+                    ],
+                    [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
+                ]
+            ),
+        )
+
+        await message.delete()
+
+    @dispatcher.message(TaskUpdate.waiting_for_postpone_reason)
+    async def process_postpone_reason(message: Message, state: FSMContext) -> None:
+        """Обрабатывает причину переноса срока задачи."""
+
+        user_id = message.from_user.id
+        update_info = task_updates.get(user_id)
+
+        if not update_info or "new_due_date" not in update_info:
+            await state.clear()
+            task_updates.pop(user_id, None)
+            await message.answer("Данные об обновлении задачи не найдены", reply_markup=main_menu_kb())
+            await message.delete()
+            return
+
+        reason = (message.text or "").strip()
+        if not reason:
+            await message.answer("❌ Укажите причину переноса")
+            await message.delete()
+            return
+
         task = TASKS.get(update_info["task_id"])
         if task is None:
             await state.clear()
@@ -1841,13 +2046,27 @@ def create_dispatcher() -> Dispatcher:
             await message.delete()
             return
 
+        new_due_date = update_info["new_due_date"]
         task.due_date = new_due_date
-        if task.status == TaskStatus.OVERDUE:
-            task.status = task.status_before_overdue or (
-                TaskStatus.ACTIVE if task.current_executor_id else TaskStatus.NEW
-            )
         task.status_before_overdue = None
-        record_task_action(task, user_id, f"Перенёс срок на {new_due_date.strftime('%d.%m.%Y')}")
+        task.status = TaskStatus.PAUSED
+        record_task_action(
+            task,
+            user_id,
+            (
+                "Отложил задачу до "
+                f"{new_due_date.strftime('%d.%m.%Y')} (причина: {reason})"
+            ),
+        )
+        await notify_task_participants(
+            message.bot,
+            task,
+            user_id,
+            (
+                "отложил(а) задачу до "
+                f"{new_due_date.strftime('%d.%m.%Y')} (причина: {reason})."
+            ),
+        )
 
         await state.clear()
         task_updates.pop(user_id, None)
