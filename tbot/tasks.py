@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 
 class TaskStatus(Enum):
@@ -50,6 +50,9 @@ class Task:
     last_actor_id: Optional[int] = None
     last_action_time: Optional[datetime] = None
     status_before_overdue: Optional[TaskStatus] = None
+    participant_statuses: Dict[int, TaskStatus] = field(default_factory=dict)
+    pending_confirmations: Set[int] = field(default_factory=set)
+    awaiting_author_confirmation: bool = False
 
 
 # Хранилище задач (временное, в памяти)
@@ -74,6 +77,13 @@ def create_task(
 
     workgroup_list = list(workgroup) if workgroup is not None else []
 
+    participants: Set[int] = {author_id}
+    if responsible_user_id:
+        participants.add(responsible_user_id)
+    participants.update(workgroup_list)
+
+    participant_statuses = {participant_id: TaskStatus.NEW for participant_id in participants}
+
     task = Task(
         task_id=_task_id_counter,
         title=title,
@@ -86,7 +96,8 @@ def create_task(
         direction=direction,
         responsible_user_id=responsible_user_id,
         workgroup=workgroup_list,
-        is_private=is_private
+        is_private=is_private,
+        participant_statuses=participant_statuses,
     )
 
     TASKS[_task_id_counter] = task
@@ -156,15 +167,19 @@ def refresh_task_status(task: Task, reference: Optional[datetime] = None) -> Non
 
     if task.due_date and task.due_date < reference:
         if task.status != TaskStatus.OVERDUE:
-            task.status_before_overdue = task.status
+            task.status_before_overdue = calculate_overall_status(task)
         task.status = TaskStatus.OVERDUE
     elif task.status == TaskStatus.OVERDUE:
         if task.due_date and task.due_date >= reference:
-            task.status = task.status_before_overdue or TaskStatus.NEW
+            previous_status = task.status_before_overdue or calculate_overall_status(task)
+            task.status = previous_status
             task.status_before_overdue = None
         elif task.due_date is None:
-            task.status = task.status_before_overdue or TaskStatus.NEW
+            previous_status = task.status_before_overdue or calculate_overall_status(task)
+            task.status = previous_status
             task.status_before_overdue = None
+    else:
+        recalc_task_status(task)
 
 
 def refresh_all_tasks_statuses(reference: Optional[datetime] = None) -> None:
@@ -187,3 +202,108 @@ def record_task_action(task: Task, user_id: int, action: str) -> None:
     task.last_action = action
     task.last_actor_id = user_id
     task.last_action_time = datetime.now()
+
+
+def get_task_participants(task: Task) -> Set[int]:
+    """Возвращает множество участников задачи."""
+
+    participants: Set[int] = {task.author_id}
+    if task.responsible_user_id:
+        participants.add(task.responsible_user_id)
+    participants.update(task.workgroup)
+    return participants
+
+
+def ensure_participant_entry(task: Task, user_id: int) -> None:
+    """Гарантирует наличие записи о статусе участника."""
+
+    if user_id not in task.participant_statuses:
+        task.participant_statuses[user_id] = TaskStatus.NEW
+
+
+def set_participant_status(task: Task, user_id: int, status: TaskStatus) -> None:
+    """Устанавливает индивидуальный статус участника."""
+
+    ensure_participant_entry(task, user_id)
+    task.participant_statuses[user_id] = status
+
+
+def set_all_participants_status(task: Task, status: TaskStatus) -> None:
+    """Устанавливает единый статус для всех участников."""
+
+    for participant_id in get_task_participants(task):
+        set_participant_status(task, participant_id, status)
+
+
+def get_participant_status(task: Task, user_id: int) -> TaskStatus:
+    """Возвращает статус участника задачи."""
+
+    ensure_participant_entry(task, user_id)
+    return task.participant_statuses[user_id]
+
+
+def calculate_overall_status(task: Task) -> TaskStatus:
+    """Определяет общий статус задачи на основе действий участников."""
+
+    participants = [
+        get_participant_status(task, participant_id)
+        for participant_id in get_task_participants(task)
+        if participant_id != task.author_id
+    ]
+
+    if task.awaiting_author_confirmation and task.pending_confirmations:
+        return TaskStatus.PAUSED
+
+    if not participants:
+        return TaskStatus.NEW
+
+    if all(status == TaskStatus.COMPLETED for status in participants):
+        return TaskStatus.COMPLETED
+
+    if any(status == TaskStatus.ACTIVE for status in participants):
+        return TaskStatus.ACTIVE
+
+    if any(status == TaskStatus.PAUSED for status in participants):
+        return TaskStatus.PAUSED
+
+    if any(status == TaskStatus.NEW for status in participants):
+        return TaskStatus.NEW
+
+    return TaskStatus.NEW
+
+
+def recalc_task_status(task: Task) -> None:
+    """Пересчитывает общий статус задачи."""
+
+    new_status = calculate_overall_status(task)
+    if task.status == TaskStatus.OVERDUE:
+        task.status_before_overdue = new_status
+    else:
+        task.status = new_status
+        task.status_before_overdue = None
+
+
+def add_pending_confirmation(task: Task, user_id: int) -> None:
+    """Добавляет участника в список ожидающих подтверждения автора."""
+
+    task.pending_confirmations.add(user_id)
+    task.awaiting_author_confirmation = True
+    recalc_task_status(task)
+
+
+def remove_pending_confirmation(task: Task, user_id: int) -> None:
+    """Удаляет участника из списка ожидающих подтверждения."""
+
+    if user_id in task.pending_confirmations:
+        task.pending_confirmations.remove(user_id)
+    if not task.pending_confirmations:
+        task.awaiting_author_confirmation = False
+    recalc_task_status(task)
+
+
+def clear_pending_confirmations(task: Task) -> None:
+    """Очищает список ожиданий подтверждения автором."""
+
+    task.pending_confirmations.clear()
+    task.awaiting_author_confirmation = False
+    recalc_task_status(task)
