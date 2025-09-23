@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Iterable
 from .greeting import greet_user
 from .users import USERS, User, get_direction_label, get_users_by_direction
+from .task_logic import should_show_take_button
 from .tasks import (
     Task,
     TaskPriority,
@@ -450,10 +451,10 @@ def get_user_full_name(user_id: int) -> str:
 def detect_user_role(task: Task, user_id: int) -> str:
     """Определяет роль пользователя в задаче."""
 
-    if user_id == task.author_id:
-        return "author"
     if user_id == task.responsible_user_id:
         return "responsible"
+    if user_id == task.author_id:
+        return "author"
     if user_id in task.workgroup:
         return "workgroup"
     return "viewer"
@@ -666,7 +667,10 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
     if viewer_role in {"author", "responsible"}:
         participant_lines: list[str] = []
         for participant_id in sorted(get_task_participants(task)):
-            if viewer_role == "responsible" and participant_id == task.author_id:
+            if (
+                participant_id == task.author_id
+                and participant_id != task.responsible_user_id
+            ):
                 continue
 
             participant_name = get_user_full_name(participant_id)
@@ -676,7 +680,14 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
                 role_label = "Ответственный"
             else:
                 role_label = "Рабочая группа"
-            participant_status = get_participant_status(task, participant_id).value
+            participant_status_enum = get_participant_status(task, participant_id)
+            if (
+                participant_id == task.author_id
+                and participant_id == task.responsible_user_id
+            ):
+                participant_status = "Ответственный"
+            else:
+                participant_status = participant_status_enum.value
             marker = ""
             if participant_id in task.pending_confirmations:
                 marker = " (ожидает подтверждения)"
@@ -710,17 +721,31 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
 
 
 # Кнопки действий с задачей
-def task_actions_kb(task_id: int):
-    context = f"{task_id}:notify:all:1"
+def task_actions_kb(task: Task, viewer_id: int | None = None) -> InlineKeyboardMarkup:
+    """Формирует клавиатуру действий с учетом роли пользователя."""
+
+    context = f"{task.task_id}:notify:all:1"
+    first_row: list[InlineKeyboardButton] = []
+
+    if viewer_id is None or should_show_take_button(
+        task.author_id,
+        task.responsible_user_id or None,
+        viewer_id,
+    ):
+        first_row.append(
+            InlineKeyboardButton(
+                text="🔄 Взять в работу", callback_data=f"take_task:{context}"
+            )
+        )
+
+    first_row.append(
+        InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}")
+    )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
-                InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}"),
-            ],
-            [
-                InlineKeyboardButton(text="🏠 Главная", callback_data="back_main"),
-            ]
+            first_row,
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
         ]
     )
 
@@ -1519,7 +1544,7 @@ def create_dispatcher() -> Dispatcher:
                             f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n"
                             f"⚡ Приоритет: {task.priority.value}"
                         ),
-                        reply_markup=task_actions_kb(task.task_id)
+                        reply_markup=task_actions_kb(task, notified_user_id)
                     )
                 except Exception as e:
                     LOGGER.error(f"Ошибка отправки уведомления пользователю {notified_user_id}: {e}")
