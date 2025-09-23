@@ -58,9 +58,13 @@ def visible_participants(participants: Iterable[int], author_id: int) -> List[in
 def should_show_take_button(author_id: int, responsible_id: int | None, user_id: int) -> bool:
     """Определяет, нужно ли показывать кнопку «Взять в работу» пользователю."""
 
-    if user_id == author_id and author_id == (responsible_id or 0):
-        return False
-    return user_id != author_id
+    if user_id != author_id:
+        return True
+
+    if responsible_id is None:
+        return True
+
+    return author_id != responsible_id
 
 
 def calculate_global_status(
