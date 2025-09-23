@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from .greeting import greet_user
 from .users import USERS, User, get_direction_label, get_users_by_direction
-from .tasks import Task, TaskPriority, TaskStatus, create_task, TASKS
+from .tasks import Task, TaskPriority, TaskStatus, create_task, TASKS, delete_task as remove_task
 
 LOGGER = logging.getLogger(__name__)
 
@@ -152,6 +152,24 @@ def tasks_filter_kb(back_to: str = "main"):
     )
 
 
+# Сопоставления для отображения статусов и приоритетов
+STATUS_ICONS = {
+    TaskStatus.NEW: "🆕",
+    TaskStatus.ACTIVE: "🔄",
+    TaskStatus.PAUSED: "⏸️",
+    TaskStatus.COMPLETED: "✅",
+}
+
+PRIORITY_ICONS = {
+    TaskPriority.CRITICAL: "🔴",
+    TaskPriority.HIGH: "🟠",
+    TaskPriority.MEDIUM: "🟡",
+    TaskPriority.LOW: "🟢",
+}
+
+TASKS_PER_PAGE = 5
+
+
 # Меню приоритетов
 def priority_kb():
     return InlineKeyboardMarkup(
@@ -247,6 +265,136 @@ def privacy_kb():
             ]
         ]
     )
+
+
+# Построение клавиатуры списка задач
+def tasks_list_kb(tasks: list[Task], view: str, filter_type: str, page: int):
+    """Создает клавиатуру со списком задач и пагинацией."""
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    start_index = (page - 1) * TASKS_PER_PAGE
+    page_tasks = tasks[start_index:start_index + TASKS_PER_PAGE]
+
+    for idx, task in enumerate(page_tasks, start=start_index + 1):
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{idx}. {task.title}",
+                callback_data=f"task_detail:{task.task_id}:{view}:{filter_type}:{page}",
+            )
+        ])
+
+    navigation_row: list[InlineKeyboardButton] = []
+    if page > 1:
+        navigation_row.append(InlineKeyboardButton(text="◀️", callback_data=f"tasks_page:{view}:{filter_type}:{page - 1}"))
+    if start_index + len(page_tasks) < len(tasks):
+        navigation_row.append(InlineKeyboardButton(text="▶️", callback_data=f"tasks_page:{view}:{filter_type}:{page + 1}"))
+    if navigation_row:
+        buttons.append(navigation_row)
+
+    buttons.append([
+        InlineKeyboardButton(text="📋 Фильтры", callback_data=f"tasks_filters:{view}"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main"),
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def task_detail_kb(task_id: int, is_author: bool, view: str, filter_type: str, page: int):
+    """Создает клавиатуру действий на экране деталей задачи."""
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task_{task_id}"),
+            InlineKeyboardButton(text="⏸️ Отложить", callback_data=f"pause_task_{task_id}"),
+        ]
+    ]
+
+    if is_author:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🗑️ Удалить/Отменить задачу",
+                callback_data=f"delete_task:{task_id}:{view}:{filter_type}:{page}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(text="◀️ К списку", callback_data=f"tasks_page:{view}:{filter_type}:{page}"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="📋 Главное меню", callback_data="back_main"),
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str:
+    """Формирует текстовое представление списка задач с нумерацией."""
+
+    total_pages = max(1, (len(tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE)
+    start_index = (page - 1) * TASKS_PER_PAGE
+    page_tasks = tasks[start_index:start_index + TASKS_PER_PAGE]
+
+    lines: list[str] = [f"📋 <b>{filter_text.capitalize()} задачи</b>"]
+    lines.append("")
+
+    for idx, task in enumerate(page_tasks, start=start_index + 1):
+        status_icon = STATUS_ICONS.get(task.status, "❓")
+        priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
+        overdue_icon = "⏰ " if task.due_date and task.due_date < datetime.now() and task.status != TaskStatus.COMPLETED else ""
+        responsible_name = USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else "Неизвестный"
+        due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Без срока"
+
+        lines.extend([
+            f"{idx}. {status_icon} {priority_icon} {overdue_icon}<b>{task.title}</b>",
+            f"   👤 {responsible_name}",
+            f"   📅 {due_date}",
+            "",
+        ])
+
+    lines.append(f"Страница {page} из {total_pages}")
+    return "\n".join(lines)
+
+
+def build_task_detail_text(task: Task) -> str:
+    """Формирует подробное описание задачи."""
+
+    responsible_name = USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else "Неизвестный"
+    author_name = USERS[task.author_id].first_name if task.author_id in USERS else "Неизвестный"
+    due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
+    created = task.created_date.strftime('%d.%m.%Y')
+    workgroup_names = [
+        USERS[user_id].first_name
+        for user_id in task.workgroup
+        if user_id in USERS
+    ]
+    workgroup_text = ", ".join(workgroup_names) if workgroup_names else "Не указана"
+    description = task.description or "Не указано"
+    project_name = PROJECTS.get(task.project, "Не указан")
+    direction_name = get_direction_label(task.direction) if task.direction else "Не указано"
+    status_icon = STATUS_ICONS.get(task.status, "❓")
+    priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
+
+    lines = [
+        f"📝 <b>{task.title}</b>",
+        "",
+        f"{status_icon} Статус: {task.status.value}",
+        f"{priority_icon} Приоритет: {task.priority.value}",
+        f"📄 Описание: {description}",
+        f"📅 Создана: {created}",
+        f"📆 Срок: {due_date}",
+        f"🏢 Проект: {project_name}",
+        f"🎯 Направление: {direction_name}",
+        f"👤 Автор: {author_name}",
+        f"✅ Ответственный: {responsible_name}",
+        f"👥 Рабочая группа: {workgroup_text}",
+    ]
+
+    if task.completed_date:
+        lines.append(f"🏁 Завершена: {task.completed_date.strftime('%d.%m.%Y')}")
+
+    return "\n".join(lines)
 
 
 # Кнопки действий с задачей
@@ -679,7 +827,10 @@ def create_dispatcher() -> Dispatcher:
                 message_id=message_id,
                 text=f"{header}\n\n{prompt}",
                 reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_description")]]
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="skip_due_date")],
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_task_description")],
+                    ]
                 ),
             )
         await message.delete()
@@ -734,6 +885,33 @@ def create_dispatcher() -> Dispatcher:
                 reply_markup=priority_kb(),
             )
         await message.delete()
+
+    @dispatcher.callback_query(F.data == "skip_due_date")
+    async def handle_skip_due_date(callback: CallbackQuery, state: FSMContext) -> None:
+        """Обрабатывает пропуск ввода даты выполнения."""
+        user_id = callback.from_user.id
+        if user_id not in task_data:
+            await state.clear()
+            await safe_edit_message(
+                callback.message,
+                text="Сессия создания задачи устарела. Начните заново.",
+                reply_markup=main_menu_kb(),
+            )
+            await callback.answer()
+            return
+
+        task_data[user_id]['due_date'] = None
+        await state.set_state(TaskCreation.waiting_for_priority)
+
+        header = build_creation_header(task_data[user_id])
+        prompt = "⚡ Выберите приоритет задачи:"
+
+        await safe_edit_message(
+            callback.message,
+            text=f"{header}\n\n{prompt}",
+            reply_markup=priority_kb(),
+        )
+        await callback.answer("Срок будет рассчитан автоматически")
 
     @dispatcher.callback_query(F.data.startswith("priority_"))
     async def handle_priority_selection(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1163,28 +1341,32 @@ def create_dispatcher() -> Dispatcher:
         
         await callback.answer()
 
-    # Обработчики фильтров задач
+    def get_tasks_for_view(view: str, user_id: int) -> list[Task]:
+        """Возвращает задачи в зависимости от выбранного режима просмотра."""
+
+        if view == "my":
+            return [task for task in TASKS.values() if user_id in task.workgroup or task.responsible_user_id == user_id]
+        return list(TASKS.values())
+
+    def filter_tasks(tasks: list[Task], filter_type: str) -> tuple[list[Task], str]:
+        """Применяет фильтр к списку задач и возвращает текст фильтра."""
+
+        if filter_type == "active":
+            return [task for task in tasks if task.status == TaskStatus.ACTIVE], "активные"
+        if filter_type == "completed":
+            return [task for task in tasks if task.status == TaskStatus.COMPLETED], "завершенные"
+        return tasks, "все"
+
     @dispatcher.callback_query(F.data.startswith("filter_"))
     async def handle_task_filters(callback: CallbackQuery, state: FSMContext) -> None:
         """Обрабатывает фильтры списка задач."""
         filter_type = callback.data.replace("filter_", "")
         user_id = callback.from_user.id
-        
-        # Получаем задачи в зависимости от типа фильтра
-        if callback.message.text.startswith("📊 Просмотр ваших задач"):
-            tasks = [task for task in TASKS.values() if user_id in task.workgroup or task.responsible_user_id == user_id]
-        else:
-            tasks = list(TASKS.values())
-        
-        if filter_type == "active":
-            tasks = [task for task in tasks if task.status == TaskStatus.ACTIVE]
-            filter_text = "активные"
-        elif filter_type == "completed":
-            tasks = [task for task in tasks if task.status == TaskStatus.COMPLETED]
-            filter_text = "завершенные"
-        else:
-            filter_text = "все"
-        
+        view = "my" if callback.message.text.startswith("📊 Просмотр ваших задач") else "all"
+
+        tasks = get_tasks_for_view(view, user_id)
+        tasks, filter_text = filter_tasks(tasks, filter_type)
+
         if not tasks:
             empty_text = (
                 f"📋 <b>{filter_text.capitalize()} задачи</b>\n\n"
@@ -1193,45 +1375,163 @@ def create_dispatcher() -> Dispatcher:
             await safe_edit_message(
                 callback.message,
                 text=empty_text,
-                reply_markup=tasks_filter_kb("main" if "ваших" in callback.message.text else "all"),
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="📋 Фильтры", callback_data=f"tasks_filters:{view}")],
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+                    ]
+                ),
             )
             await callback.answer()
             return
-        
-        # Формируем список задач
-        tasks_text = f"📋 <b>{filter_text.capitalize()} задачи</b>\n\n"
-        for i, task in enumerate(tasks[:10], 1):  # Ограничиваем 10 задачами
-            status_icon = {
-                TaskStatus.NEW: "🆕",
-                TaskStatus.ACTIVE: "🔄", 
-                TaskStatus.PAUSED: "⏸️",
-                TaskStatus.COMPLETED: "✅"
-            }.get(task.status, "❓")
-            
-            priority_icon = {
-                TaskPriority.CRITICAL: "🔴",
-                TaskPriority.HIGH: "🟠",
-                TaskPriority.MEDIUM: "🟡", 
-                TaskPriority.LOW: "🟢"
-            }.get(task.priority, "⚪")
-            
-            overdue = "⏰ " if task.due_date and task.due_date < datetime.now() and task.status != TaskStatus.COMPLETED else ""
-            
-            tasks_text += (
-                f"{i}. {status_icon} {priority_icon} {overdue}<b>{task.title}</b>\n"
-                f"   👤 {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}\n"
-                f"   📅 {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Без срока'}\n\n"
-            )
-        
-        if len(tasks) > 10:
-            tasks_text += f"\n... и еще {len(tasks) - 10} задач"
-        
+
+        page = 1
+        tasks_text = build_tasks_list_text(tasks, filter_text, page)
+        keyboard = tasks_list_kb(tasks, view, filter_type, page)
+
         await safe_edit_message(
             callback.message,
             text=tasks_text,
-            reply_markup=tasks_filter_kb("main" if "ваших" in callback.message.text else "all"),
+            reply_markup=keyboard,
         )
         await callback.answer()
+
+    @dispatcher.callback_query(F.data.startswith("tasks_page:"))
+    async def handle_tasks_page(callback: CallbackQuery, state: FSMContext) -> None:
+        """Переключает страницы списка задач."""
+        _, view, filter_type, page_str = callback.data.split(":", 3)
+        user_id = callback.from_user.id
+        tasks = get_tasks_for_view(view, user_id)
+        tasks, filter_text = filter_tasks(tasks, filter_type)
+
+        if not tasks:
+            await callback.answer("Задачи не найдены", show_alert=True)
+            return
+
+        total_pages = max(1, (len(tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE)
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 1
+        page = max(1, min(page, total_pages))
+
+        tasks_text = build_tasks_list_text(tasks, filter_text, page)
+        keyboard = tasks_list_kb(tasks, view, filter_type, page)
+
+        await safe_edit_message(
+            callback.message,
+            text=tasks_text,
+            reply_markup=keyboard,
+        )
+        await callback.answer()
+
+    @dispatcher.callback_query(F.data.startswith("task_detail:"))
+    async def handle_task_detail(callback: CallbackQuery, state: FSMContext) -> None:
+        """Показывает подробную информацию о задаче."""
+        parts = callback.data.split(":")
+        if len(parts) != 5:
+            await callback.answer("Некорректные данные", show_alert=True)
+            return
+
+        _, task_id_str, view, filter_type, page_str = parts
+        try:
+            task_id = int(task_id_str)
+            page = int(page_str)
+        except ValueError:
+            await callback.answer("Некорректные данные", show_alert=True)
+            return
+
+        task = TASKS.get(task_id)
+        if not task:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+
+        text = build_task_detail_text(task)
+        keyboard = task_detail_kb(task.task_id, callback.from_user.id == task.author_id, view, filter_type, page)
+
+        await safe_edit_message(
+            callback.message,
+            text=text,
+            reply_markup=keyboard,
+        )
+        await callback.answer()
+
+    @dispatcher.callback_query(F.data.startswith("tasks_filters:"))
+    async def handle_tasks_filters_menu(callback: CallbackQuery, state: FSMContext) -> None:
+        """Возвращает пользователя к выбору фильтра."""
+        _, view = callback.data.split(":", 1)
+        list_type = "всех" if view == "all" else "ваших"
+        text = f"📊 Просмотр {list_type} задач. Выберите фильтр:"
+
+        await safe_edit_message(
+            callback.message,
+            text=text,
+            reply_markup=tasks_filter_kb(),
+        )
+        await callback.answer()
+
+    @dispatcher.callback_query(F.data.startswith("delete_task:"))
+    async def handle_delete_task(callback: CallbackQuery, state: FSMContext) -> None:
+        """Удаляет задачу, если это делает автор."""
+        parts = callback.data.split(":")
+        if len(parts) != 5:
+            await callback.answer("Некорректные данные", show_alert=True)
+            return
+
+        _, task_id_str, view, filter_type, page_str = parts
+        try:
+            task_id = int(task_id_str)
+            page = int(page_str)
+        except ValueError:
+            await callback.answer("Некорректные данные", show_alert=True)
+            return
+
+        user_id = callback.from_user.id
+        task = TASKS.get(task_id)
+
+        if not task:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+
+        if task.author_id != user_id:
+            await callback.answer("Удалить задачу может только автор", show_alert=True)
+            return
+
+        remove_task(task_id)
+
+        tasks = get_tasks_for_view(view, user_id)
+        tasks, filter_text = filter_tasks(tasks, filter_type)
+
+        if not tasks:
+            empty_text = (
+                f"📋 <b>{filter_text.capitalize()} задачи</b>\n\n"
+                "Задачи не найдены."
+            )
+            await safe_edit_message(
+                callback.message,
+                text=empty_text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="📋 Фильтры", callback_data=f"tasks_filters:{view}")],
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+                    ]
+                ),
+            )
+            await callback.answer("Задача удалена")
+            return
+
+        total_pages = max(1, (len(tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE)
+        page = max(1, min(page, total_pages))
+        tasks_text = build_tasks_list_text(tasks, filter_text, page)
+        keyboard = tasks_list_kb(tasks, view, filter_type, page)
+
+        await safe_edit_message(
+            callback.message,
+            text=tasks_text,
+            reply_markup=keyboard,
+        )
+        await callback.answer("Задача удалена")
+
 
     # Обработчики действий с задачами
     @dispatcher.callback_query(F.data.startswith("take_task_"))
