@@ -14,6 +14,7 @@ class TaskStatus(Enum):
     NEW = "Новая"
     ACTIVE = "В работе"
     PAUSED = "На паузе"
+    IN_REVIEW = "На проверке"
     COMPLETED = "Завершена"
     OVERDUE = "Просрочена"
 
@@ -252,7 +253,7 @@ def calculate_overall_status(task: Task) -> TaskStatus:
     ]
 
     if task.awaiting_author_confirmation and task.pending_confirmations:
-        return TaskStatus.PAUSED
+        return TaskStatus.IN_REVIEW
 
     if not participants:
         return TaskStatus.NEW
