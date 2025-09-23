@@ -12,7 +12,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from .greeting import greet_user
 from .users import USERS, User, get_direction_label, get_users_by_direction
-from .tasks import Task, TaskPriority, TaskStatus, create_task, TASKS, delete_task as remove_task
+from .tasks import (
+    Task,
+    TaskPriority,
+    TaskStatus,
+    TASKS,
+    create_task,
+    delete_task as remove_task,
+    get_involved_tasks,
+    is_user_involved,
+    record_task_action,
+    refresh_all_tasks_statuses,
+    refresh_task_status,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,6 +87,10 @@ class TaskCreation(StatesGroup):
     waiting_for_responsible = State()
     waiting_for_workgroup = State()
     waiting_for_privacy = State()
+
+
+class TaskUpdate(StatesGroup):
+    waiting_for_postpone_date = State()
 
 
 @dataclass(slots=True)
@@ -146,7 +162,7 @@ def tasks_filter_kb(back_to: str = "main"):
                 InlineKeyboardButton(text="Все задачи", callback_data="filter_all")
             ],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back_{back_to}")
+                InlineKeyboardButton(text="🏠 Главная", callback_data=f"back_{back_to}")
             ]
         ]
     )
@@ -158,6 +174,7 @@ STATUS_ICONS = {
     TaskStatus.ACTIVE: "🔄",
     TaskStatus.PAUSED: "⏸️",
     TaskStatus.COMPLETED: "✅",
+    TaskStatus.OVERDUE: "⏰",
 }
 
 PRIORITY_ICONS = {
@@ -295,35 +312,48 @@ def tasks_list_kb(tasks: list[Task], view: str, filter_type: str, page: int):
         InlineKeyboardButton(text="📋 Фильтры", callback_data=f"tasks_filters:{view}"),
     ])
     buttons.append([
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main"),
+        InlineKeyboardButton(text="🏠 Главная", callback_data="back_main"),
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def task_detail_kb(task_id: int, is_author: bool, view: str, filter_type: str, page: int):
+def task_detail_kb(task: Task, viewer_id: int, view: str, filter_type: str, page: int):
     """Создает клавиатуру действий на экране деталей задачи."""
 
-    buttons: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task_{task_id}"),
-            InlineKeyboardButton(text="⏸️ Отложить", callback_data=f"pause_task_{task_id}"),
-        ]
-    ]
+    buttons: list[list[InlineKeyboardButton]] = []
+    context = f"{task.task_id}:{view}:{filter_type}:{page}"
 
-    if is_author:
+    if task.status != TaskStatus.COMPLETED:
+        if task.current_executor_id == viewer_id:
+            buttons.append([
+                InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete_task:{context}"),
+                InlineKeyboardButton(text="⏸️ Пауза", callback_data=f"pause_task:{context}"),
+            ])
+            buttons.append([
+                InlineKeyboardButton(text="🕒 Отложить", callback_data=f"postpone_task:{context}"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_task:{context}"),
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
+            ])
+
+    if task.author_id == viewer_id:
         buttons.append([
             InlineKeyboardButton(
                 text="🗑️ Удалить/Отменить задачу",
-                callback_data=f"delete_task:{task_id}:{view}:{filter_type}:{page}",
+                callback_data=f"delete_task:{task.task_id}:{view}:{filter_type}:{page}",
             )
         ])
 
+    if view in {"all", "my"}:
+        buttons.append([
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tasks_page:{view}:{filter_type}:{page}"),
+        ])
+
     buttons.append([
-        InlineKeyboardButton(text="◀️ К списку", callback_data=f"tasks_page:{view}:{filter_type}:{page}"),
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="📋 Главное меню", callback_data="back_main"),
+        InlineKeyboardButton(text="🏠 Главная", callback_data="back_main"),
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -340,9 +370,10 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
     lines.append("")
 
     for idx, task in enumerate(page_tasks, start=start_index + 1):
+        refresh_task_status(task)
         status_icon = STATUS_ICONS.get(task.status, "❓")
         priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
-        overdue_icon = "⏰ " if task.due_date and task.due_date < datetime.now() and task.status != TaskStatus.COMPLETED else ""
+        overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
         responsible_name = USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else "Неизвестный"
         due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Без срока"
 
@@ -350,8 +381,13 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
             f"{idx}. {status_icon} {priority_icon} {overdue_icon}<b>{task.title}</b>",
             f"   👤 {responsible_name}",
             f"   📅 {due_date}",
-            "",
         ])
+
+        if task.current_executor_id and task.current_executor_id in USERS:
+            executor_name = USERS[task.current_executor_id].first_name
+            lines.append(f"   👷 Исполнитель: {executor_name}")
+
+        lines.append("")
 
     lines.append(f"Страница {page} из {total_pages}")
     return "\n".join(lines)
@@ -360,6 +396,7 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
 def build_task_detail_text(task: Task) -> str:
     """Формирует подробное описание задачи."""
 
+    refresh_task_status(task)
     responsible_name = USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else "Неизвестный"
     author_name = USERS[task.author_id].first_name if task.author_id in USERS else "Неизвестный"
     due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
@@ -375,6 +412,9 @@ def build_task_detail_text(task: Task) -> str:
     direction_name = get_direction_label(task.direction) if task.direction else "Не указано"
     status_icon = STATUS_ICONS.get(task.status, "❓")
     priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
+    executor_name = None
+    if task.current_executor_id and task.current_executor_id in USERS:
+        executor_name = USERS[task.current_executor_id].first_name
 
     lines = [
         f"📝 <b>{task.title}</b>",
@@ -391,6 +431,18 @@ def build_task_detail_text(task: Task) -> str:
         f"👥 Рабочая группа: {workgroup_text}",
     ]
 
+    if executor_name:
+        lines.append(f"👷 Исполнитель: {executor_name}")
+
+    if task.last_action and task.last_actor_id:
+        actor = USERS.get(task.last_actor_id)
+        actor_name = actor.first_name if actor else "Неизвестный"
+        if task.last_action_time:
+            action_time = task.last_action_time.strftime('%d.%m.%Y %H:%M')
+            lines.append(f"📌 Последнее действие: {task.last_action} — {actor_name} ({action_time})")
+        else:
+            lines.append(f"📌 Последнее действие: {task.last_action} — {actor_name}")
+
     if task.completed_date:
         lines.append(f"🏁 Завершена: {task.completed_date.strftime('%d.%m.%Y')}")
 
@@ -399,14 +451,14 @@ def build_task_detail_text(task: Task) -> str:
 
 # Кнопки действий с задачей
 def task_actions_kb(task_id: int):
+    context = f"{task_id}:notify:all:1"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task_{task_id}"),
-                InlineKeyboardButton(text="⏸️ Отложить", callback_data=f"pause_task_{task_id}"),
+                InlineKeyboardButton(text="🔄 Взять в работу", callback_data=f"take_task:{context}"),
             ],
             [
-                InlineKeyboardButton(text="📋 Главное меню", callback_data="back_main"),
+                InlineKeyboardButton(text="🏠 Главная", callback_data="back_main"),
             ]
         ]
     )
@@ -421,7 +473,7 @@ def help_menu_kb():
                 InlineKeyboardButton(text="🟢 Статусы задач", callback_data="help_statuses")
             ],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")
+                InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")
             ]
         ]
     )
@@ -471,24 +523,31 @@ def back_button_kb(back_to: str):
 def get_main_message(user_id: int) -> str:
     """Формирует главное сообщение со статистикой."""
     greeting = greet_user(user_id)
-    
+
     if "Доступ ограничен" in greeting:
         return greeting
-    
-    # Краткая статистика
-    user_tasks = [task for task in TASKS.values() if user_id in task.workgroup or task.responsible_user_id == user_id]
+
+    refresh_all_tasks_statuses()
+    user_tasks = get_involved_tasks(user_id)
     active_tasks = [task for task in user_tasks if task.status == TaskStatus.ACTIVE]
-    overdue_tasks = [task for task in user_tasks if task.due_date and task.due_date < datetime.now() and task.status != TaskStatus.COMPLETED]
-    
+    overdue_tasks = [task for task in user_tasks if task.status == TaskStatus.OVERDUE]
+    completed_tasks = [task for task in user_tasks if task.status == TaskStatus.COMPLETED]
+    pending_tasks = [task for task in user_tasks if task.status != TaskStatus.COMPLETED]
+    new_tasks = [
+        task
+        for task in user_tasks
+        if task.status in {TaskStatus.NEW, TaskStatus.PAUSED}
+    ]
+
     stats_text = (
         f"{greeting}\n\n"
         "📊 <b>Краткая статистика:</b>\n"
-        f"📋 Задачи на сегодня: {len([t for t in active_tasks if t.due_date and t.due_date.date() == datetime.now().date()])}\n"
-        f"📈 Всего задач: {len(user_tasks)}\n"
+        f"📋 Задачи на сегодня: {len(pending_tasks)}\n"
+        f"📈 Всего задач: {len(TASKS)}\n"
         f"⏰ Просрочено: {len(overdue_tasks)}\n"
         f"🔄 В работе: {len(active_tasks)}\n"
-        f"✅ Завершено: {len([t for t in user_tasks if t.status == TaskStatus.COMPLETED])}\n"
-        f"🆕 Новых задач: {len([t for t in user_tasks if t.status == TaskStatus.NEW])}"
+        f"✅ Завершено: {len(completed_tasks)}\n"
+        f"🆕 Новых задач: {len(new_tasks)}"
     )
     return stats_text
 
@@ -581,6 +640,7 @@ def create_dispatcher() -> Dispatcher:
 
     # Хранилище данных для создания задачи
     task_data = {}
+    task_updates: dict[int, dict] = {}
 
     async def safe_edit_message(message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         """Безопасно редактирует сообщение, игнорируя отсутствие изменений."""
@@ -1174,6 +1234,7 @@ def create_dispatcher() -> Dispatcher:
                 workgroup=workgroup_users,
                 is_private=task_info['is_private']
             )
+            record_task_action(task, user_id, "Создал задачу")
 
             # Отправляем уведомления
             bot = callback.bot
@@ -1344,8 +1405,10 @@ def create_dispatcher() -> Dispatcher:
     def get_tasks_for_view(view: str, user_id: int) -> list[Task]:
         """Возвращает задачи в зависимости от выбранного режима просмотра."""
 
+        refresh_all_tasks_statuses()
+
         if view == "my":
-            return [task for task in TASKS.values() if user_id in task.workgroup or task.responsible_user_id == user_id]
+            return get_involved_tasks(user_id)
         return list(TASKS.values())
 
     def filter_tasks(tasks: list[Task], filter_type: str) -> tuple[list[Task], str]:
@@ -1356,6 +1419,51 @@ def create_dispatcher() -> Dispatcher:
         if filter_type == "completed":
             return [task for task in tasks if task.status == TaskStatus.COMPLETED], "завершенные"
         return tasks, "все"
+
+    async def render_task_detail(
+        message: Message,
+        task: Task,
+        viewer_id: int,
+        view: str,
+        filter_type: str,
+        page: int,
+    ) -> None:
+        """Обновляет сообщение с карточкой задачи."""
+
+        text = build_task_detail_text(task)
+        keyboard = task_detail_kb(task, viewer_id, view, filter_type, page)
+
+        await safe_edit_message(
+            message,
+            text=text,
+            reply_markup=keyboard,
+        )
+
+    def extract_action_context(callback_data: str, prefix: str) -> tuple[int, str, str, int]:
+        """Извлекает параметры из данных коллбэка."""
+
+        default_context = (0, "notify", "all", 1)
+
+        if callback_data.startswith(f"{prefix}:"):
+            parts = callback_data.split(":", 4)
+            if len(parts) == 5:
+                _, task_id_str, view, filter_type, page_str = parts
+                try:
+                    task_id = int(task_id_str)
+                    page = int(page_str)
+                except ValueError:
+                    return default_context
+                return task_id, view, filter_type, page
+            return default_context
+
+        if callback_data.startswith(f"{prefix}_"):
+            try:
+                task_id = int(callback_data.replace(f"{prefix}_", ""))
+            except ValueError:
+                return default_context
+            return task_id, "notify", "all", 1
+
+        return default_context
 
     @dispatcher.callback_query(F.data.startswith("filter_"))
     async def handle_task_filters(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1378,7 +1486,7 @@ def create_dispatcher() -> Dispatcher:
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="📋 Фильтры", callback_data=f"tasks_filters:{view}")],
-                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+                        [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
                     ]
                 ),
             )
@@ -1446,13 +1554,13 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Задача не найдена", show_alert=True)
             return
 
-        text = build_task_detail_text(task)
-        keyboard = task_detail_kb(task.task_id, callback.from_user.id == task.author_id, view, filter_type, page)
-
-        await safe_edit_message(
+        await render_task_detail(
             callback.message,
-            text=text,
-            reply_markup=keyboard,
+            task,
+            callback.from_user.id,
+            view,
+            filter_type,
+            page,
         )
         await callback.answer()
 
@@ -1513,7 +1621,7 @@ def create_dispatcher() -> Dispatcher:
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="📋 Фильтры", callback_data=f"tasks_filters:{view}")],
-                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+                        [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
                     ]
                 ),
             )
@@ -1534,55 +1642,233 @@ def create_dispatcher() -> Dispatcher:
 
 
     # Обработчики действий с задачами
-    @dispatcher.callback_query(F.data.startswith("take_task_"))
+    @dispatcher.callback_query(F.data.startswith("back_task_detail:"))
+    async def handle_back_task_detail(callback: CallbackQuery, state: FSMContext) -> None:
+        """Возвращает пользователя к карточке задачи."""
+
+        user_id = callback.from_user.id
+        await state.clear()
+        task_updates.pop(user_id, None)
+
+        task_id, view, filter_type, page = extract_action_context(callback.data, "back_task_detail")
+        task = TASKS.get(task_id)
+
+        if not task:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer()
+
+    async def ensure_task_for_action(
+        callback: CallbackQuery,
+        prefix: str,
+    ) -> tuple[Task | None, str, str, int]:
+        """Возвращает задачу и параметры отображения для действия."""
+
+        task_id, view, filter_type, page = extract_action_context(callback.data, prefix)
+        task = TASKS.get(task_id)
+
+        if not task:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return None, view, filter_type, page
+
+        return task, view, filter_type, page
+
+    def can_manage_task(task: Task, user_id: int) -> bool:
+        """Проверяет, может ли пользователь управлять задачей."""
+
+        return (
+            task.current_executor_id == user_id
+            or task.responsible_user_id == user_id
+            or task.author_id == user_id
+        )
+
+    @dispatcher.callback_query(F.data.startswith("take_task"))
     async def handle_take_task(callback: CallbackQuery, state: FSMContext) -> None:
         """Обрабатывает взятие задачи в работу."""
-        task_id = int(callback.data.replace("take_task_", ""))
-        
-        if task_id in TASKS:
-            task = TASKS[task_id]
-            task.status = TaskStatus.ACTIVE
 
-            taken_text = (
-                "✅ <b>Задача взята в работу!</b>\n\n"
-                f"📝 <b>{task.title}</b>\n"
-                "🔄 Статус: В работе\n"
-                f"👤 Ответственный: {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}"
-            )
-            await safe_edit_message(
-                callback.message,
-                text=taken_text,
-                reply_markup=main_menu_kb(),
-            )
-        else:
-            await callback.answer("❌ Задача не найдена!")
-        
-        await callback.answer()
+        task, view, filter_type, page = await ensure_task_for_action(callback, "take_task")
+        if task is None:
+            return
 
-    @dispatcher.callback_query(F.data.startswith("pause_task_"))
+        user_id = callback.from_user.id
+        if not is_user_involved(task, user_id):
+            await callback.answer("Эта задача вам недоступна", show_alert=True)
+            return
+
+        task.current_executor_id = user_id
+        task.status = TaskStatus.ACTIVE
+        task.completed_date = None
+        task.status_before_overdue = None
+        record_task_action(task, user_id, "Взял задачу в работу")
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Задача взята в работу")
+
+    @dispatcher.callback_query(F.data.startswith("pause_task"))
     async def handle_pause_task(callback: CallbackQuery, state: FSMContext) -> None:
-        """Обрабатывает приостановку задачи."""
-        task_id = int(callback.data.replace("pause_task_", ""))
-        
-        if task_id in TASKS:
-            task = TASKS[task_id]
-            task.status = TaskStatus.PAUSED
+        """Обрабатывает постановку задачи на паузу."""
 
-            paused_text = (
-                "⏸️ <b>Задача приостановлена</b>\n\n"
-                f"📝 <b>{task.title}</b>\n"
-                "⏸️ Статус: На паузе\n"
-                f"👤 Ответственный: {USERS[task.responsible_user_id].first_name if task.responsible_user_id in USERS else 'Неизвестный'}"
-            )
-            await safe_edit_message(
-                callback.message,
-                text=paused_text,
-                reply_markup=main_menu_kb(),
-            )
-        else:
-            await callback.answer("❌ Задача не найдена!")
-        
+        task, view, filter_type, page = await ensure_task_for_action(callback, "pause_task")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if not can_manage_task(task, user_id):
+            await callback.answer("Нет прав для изменения задачи", show_alert=True)
+            return
+
+        task.status = TaskStatus.PAUSED
+        task.status_before_overdue = None
+        record_task_action(task, user_id, "Поставил задачу на паузу")
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Задача на паузе")
+
+    @dispatcher.callback_query(F.data.startswith("complete_task"))
+    async def handle_complete_task(callback: CallbackQuery, state: FSMContext) -> None:
+        """Обрабатывает завершение задачи."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "complete_task")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if not can_manage_task(task, user_id):
+            await callback.answer("Нет прав для завершения", show_alert=True)
+            return
+
+        task.status = TaskStatus.COMPLETED
+        task.completed_date = datetime.now()
+        task.current_executor_id = user_id
+        task.status_before_overdue = None
+        record_task_action(task, user_id, "Завершил задачу")
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Задача завершена")
+
+    @dispatcher.callback_query(F.data.startswith("cancel_task"))
+    async def handle_cancel_task_action(callback: CallbackQuery, state: FSMContext) -> None:
+        """Обрабатывает отмену выполнения задачи."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "cancel_task")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if not can_manage_task(task, user_id):
+            await callback.answer("Нет прав для отмены", show_alert=True)
+            return
+
+        task.status = TaskStatus.NEW
+        task.current_executor_id = None
+        task.completed_date = None
+        task.status_before_overdue = None
+        record_task_action(task, user_id, "Отменил выполнение задачи")
+
+        await render_task_detail(callback.message, task, user_id, view, filter_type, page)
+        await callback.answer("Задача освобождена")
+
+    @dispatcher.callback_query(F.data.startswith("postpone_task"))
+    async def handle_postpone_task(callback: CallbackQuery, state: FSMContext) -> None:
+        """Запрашивает новую дату сдачи задачи."""
+
+        task, view, filter_type, page = await ensure_task_for_action(callback, "postpone_task")
+        if task is None:
+            return
+
+        user_id = callback.from_user.id
+        if not can_manage_task(task, user_id):
+            await callback.answer("Нет прав для изменения срока", show_alert=True)
+            return
+
+        await state.set_state(TaskUpdate.waiting_for_postpone_date)
+        task_updates[user_id] = {
+            "task_id": task.task_id,
+            "view": view,
+            "filter": filter_type,
+            "page": page,
+            "message_id": callback.message.message_id,
+        }
+
+        prompt = (
+            "🕒 Введите новую дату завершения задачи в формате ДД.ММ.ГГГГ\n"
+            "Или нажмите \"⬅️ Назад\" для отмены изменения"
+        )
+
+        await safe_edit_message(
+            callback.message,
+            text=prompt,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data=f"back_task_detail:{task.task_id}:{view}:{filter_type}:{page}",
+                        )
+                    ],
+                    [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
+                ]
+            ),
+        )
+
         await callback.answer()
+
+    @dispatcher.message(TaskUpdate.waiting_for_postpone_date)
+    async def process_postpone_date(message: Message, state: FSMContext) -> None:
+        """Обрабатывает перенос срока задачи."""
+
+        user_id = message.from_user.id
+        update_info = task_updates.get(user_id)
+
+        if not update_info:
+            await state.clear()
+            await message.answer("Данные об обновлении задачи не найдены", reply_markup=main_menu_kb())
+            return
+
+        new_due_date = parse_date(message.text)
+        if not new_due_date:
+            await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ")
+            await message.delete()
+            return
+
+        task = TASKS.get(update_info["task_id"])
+        if task is None:
+            await state.clear()
+            task_updates.pop(user_id, None)
+            await message.answer("Задача не найдена", reply_markup=main_menu_kb())
+            await message.delete()
+            return
+
+        task.due_date = new_due_date
+        if task.status == TaskStatus.OVERDUE:
+            task.status = task.status_before_overdue or (
+                TaskStatus.ACTIVE if task.current_executor_id else TaskStatus.NEW
+            )
+        task.status_before_overdue = None
+        record_task_action(task, user_id, f"Перенёс срок на {new_due_date.strftime('%d.%m.%Y')}")
+
+        await state.clear()
+        task_updates.pop(user_id, None)
+
+        await safe_edit_message_by_id(
+            message.bot,
+            chat_id=message.chat.id,
+            message_id=update_info["message_id"],
+            text=build_task_detail_text(task),
+            reply_markup=task_detail_kb(
+                task,
+                user_id,
+                update_info["view"],
+                update_info["filter"],
+                update_info["page"],
+            ),
+        )
+
+        await message.delete()
+
+    return dispatcher
 
     return dispatcher
 
