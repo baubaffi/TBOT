@@ -8,13 +8,10 @@ import asyncio
 import importlib.util
 import logging
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Tuple
-
 from .greeting import greet_user
-from .users import USERS, User
+from .users import USERS, User, get_direction_label, get_users_by_direction
 from .tasks import Task, TaskPriority, TaskStatus, create_task, TASKS
 
 LOGGER = logging.getLogger(__name__)
@@ -36,7 +33,7 @@ from aiogram.client.default import DefaultBotProperties
 # Списки проектов и направлений
 PROJECTS = {
     "crmk": "ЦРМК Буколпак",
-    "kinoclub": "Киноклуб Кадр", 
+    "kinoclub": "Киноклуб Кадр",
     "anticafe": "Антикафе Ковёр",
     "literature": "Литературный клуб Переплёт",
     "boardgames": "Проект Настолки с ведущим",
@@ -50,22 +47,21 @@ PROJECTS = {
 DIRECTIONS = {
     "all": "Все направления",
     "stn": "Социально-творческое направление (СТН)",
-    "oan": "Организационно-аналитическое направление (ОАН)", 
+    "oan": "Организационно-аналитическое направление (ОАН)",
     "nmsd": "Направление маркетинга, смм, дизайна (НМСД)",
     "noim": "Направление обучения и методологии (НОиМ)",
     "nnia": "Направление набора и адаптации (ННиА)",
 }
 
-USER_DIRECTIONS: Dict[int, Tuple[str, ...]] = {
-    1311714242: ("СТН",),
-    609995295: ("Все направления",),
-    459228268: ("НОиМ",),
-    5055233726: ("СТН",),
-    7216096348: ("СТН",),
-    678543417: ("НМСД", "ОАН", "СТН"),
-    5575874649: ("СТН", "НиА"),
-    7247710860: ("ОАН", "НОиМ", "НМСД", "НиА"),
-}
+
+# Вспомогательная функция для отображения названия направления
+def direction_title(direction_id: str) -> str:
+    """Возвращает название направления без сокращения в скобках."""
+
+    label = get_direction_label(direction_id)
+    if "(" in label and ")" in label:
+        return label.split("(")[0].strip()
+    return label
 
 # Состояния для создания задачи
 class TaskCreation(StatesGroup):
@@ -97,19 +93,6 @@ def is_admin(user_id: int) -> bool:
         return False
 
 
-def get_users_by_direction(direction: str) -> list[User]:
-    """Возвращает список пользователей по направлению."""
-    users = []
-    direction_key = direction.upper()
-    
-    for user_id, user_directions in USER_DIRECTIONS.items():
-        if direction_key in user_directions or "Все направления" in user_directions:
-            if user_id in USERS:
-                users.append(USERS[user_id])
-    
-    return users
-
-
 def parse_date(date_str: str) -> datetime | None:
     """Парсит дату из строки в формате ДД.ММ.ГГГГ или ДД-ММ-ГГГГ."""
     try:
@@ -120,13 +103,13 @@ def parse_date(date_str: str) -> datetime | None:
         return None
 
 
-def calculate_due_date(priority: str, created_date: datetime) -> datetime:
+def calculate_due_date(priority: TaskPriority, created_date: datetime) -> datetime:
     """Рассчитывает дату выполнения на основе приоритета."""
     priority_days = {
-        "critical": 1,
-        "high": 3, 
-        "medium": 10,
-        "low": 15
+        TaskPriority.CRITICAL: 1,
+        TaskPriority.HIGH: 3,
+        TaskPriority.MEDIUM: 10,
+        TaskPriority.LOW: 15,
     }
     days = priority_days.get(priority, 10)
     return created_date + timedelta(days=days)
@@ -622,9 +605,15 @@ def create_dispatcher() -> Dispatcher:
             await callback.message.edit_text("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
             return
         
-        priority = callback.data.replace("priority_", "")
+        priority_key = callback.data.replace("priority_", "")
+        try:
+            priority = TaskPriority[priority_key.upper()]
+        except KeyError:
+            await callback.answer("❌ Неизвестный приоритет", show_alert=True)
+            return
+
         task_data[user_id]['priority'] = priority
-        
+
         # Если дата не была указана, рассчитываем автоматически
         if not task_data[user_id].get('due_date'):
             due_date = calculate_due_date(priority, task_data[user_id]['created_date'])
@@ -669,8 +658,8 @@ def create_dispatcher() -> Dispatcher:
         task_data[user_id]['direction'] = direction_id
         
         # Получаем пользователей направления для выбора ответственного
-        direction_name = DIRECTIONS[direction_id].split('(')[0].strip()
-        users = get_users_by_direction(direction_name)
+        direction_name = direction_title(direction_id)
+        users = get_users_by_direction(direction_id)
         
         await state.set_state(TaskCreation.waiting_for_responsible)
         await callback.message.edit_text(
@@ -689,15 +678,22 @@ def create_dispatcher() -> Dispatcher:
             return
         
         selected_user_id = int(callback.data.replace("responsible_", ""))
-        task_data[user_id]['responsible_users'].add(selected_user_id)
+        selected_responsible = task_data[user_id]['responsible_users']
         
-        direction_name = DIRECTIONS[task_data[user_id]['direction']].split('(')[0].strip()
-        users = get_users_by_direction(direction_name)
+        if selected_user_id in selected_responsible:
+            selected_responsible.remove(selected_user_id)
+        else:
+            selected_responsible.clear()
+            selected_responsible.add(selected_user_id)
+        
+        direction_id = task_data[user_id]['direction']
+        direction_name = direction_title(direction_id)
+        users = get_users_by_direction(direction_id)
         
         await callback.message.edit_text(
-            f"👤 Выберите ответственного за задачу (направление: {direction_name}):\n"
-            f"✅ Выбрано: {len(task_data[user_id]['responsible_users'])}",
-            reply_markup=users_kb(users, task_data[user_id]['responsible_users'], "responsible", "direction")
+            f"👤 Выберите ответственного за задачу (направление: {direction_name}):\n",
+            f"✅ Выбрано: {len(selected_responsible)}",
+            reply_markup=users_kb(users, selected_responsible, "responsible", "direction")
         )
         await callback.answer()
 
@@ -714,8 +710,9 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("❌ Нужно выбрать хотя бы одного ответственного!")
             return
         
-        direction_name = DIRECTIONS[task_data[user_id]['direction']].split('(')[0].strip()
-        users = get_users_by_direction(direction_name)
+        direction_id = task_data[user_id]['direction']
+        direction_name = direction_title(direction_id)
+        users = get_users_by_direction(direction_id)
         
         await state.set_state(TaskCreation.waiting_for_workgroup)
         await callback.message.edit_text(
@@ -740,11 +737,12 @@ def create_dispatcher() -> Dispatcher:
         else:
             task_data[user_id]['workgroup_users'].add(selected_user_id)
         
-        direction_name = DIRECTIONS[task_data[user_id]['direction']].split('(')[0].strip()
-        users = get_users_by_direction(direction_name)
+        direction_id = task_data[user_id]['direction']
+        direction_name = direction_title(direction_id)
+        users = get_users_by_direction(direction_id)
         
         await callback.message.edit_text(
-            "👥 Выберите рабочую группу (можно выбрать несколько):\n"
+            "👥 Выберите рабочую группу (можно выбрать несколько):\n",
             f"✅ Выбрано: {len(task_data[user_id]['workgroup_users'])}",
             reply_markup=users_kb(users, task_data[user_id]['workgroup_users'], "workgroup", "responsible")
         )
@@ -781,52 +779,62 @@ def create_dispatcher() -> Dispatcher:
         # Создаем задачу
         task_info = task_data[user_id]
         try:
+            responsible_user_id = next(iter(task_info['responsible_users']))
+            workgroup_users = list(task_info['workgroup_users'])
             task = create_task(
                 title=task_info['title'],
                 description=task_info['description'],
                 author_id=user_id,
-                priority=TaskPriority(task_info['priority']),
+                priority=task_info['priority'],
                 due_date=task_info['due_date'],
                 project=task_info['project'],
                 direction=task_info['direction'],
-                responsible_user_id=list(task_info['responsible_users'])[0],  # Берем первого ответственного
-                workgroup=list(task_info['workgroup_users']),
+                responsible_user_id=responsible_user_id,
+                workgroup=workgroup_users,
                 is_private=task_info['is_private']
             )
-            
+
             # Отправляем уведомления
             bot = callback.bot
-            all_notified_users = set(task_info['responsible_users']).union(task_info['workgroup_users'])
-            
+            all_notified_users = {responsible_user_id}
+            all_notified_users.update(workgroup_users)
+
+            responsible_user = USERS.get(responsible_user_id)
+            responsible_name = responsible_user.first_name if responsible_user else "Неизвестный"
+
             for notified_user_id in all_notified_users:
-                if notified_user_id in USERS:
-                    try:
-                        user_name = USERS[notified_user_id].first_name
-                        await bot.send_message(
-                            chat_id=notified_user_id,
-                            text=f"🔔 <b>Новая задача назначена!</b>\n\n"
-                                 f"📝 <b>{task_info['title']}</b>\n"
-                                 f"👤 Ответственный: {USERS[task_info['responsible_users'].pop()].first_name}\n"
-                                 f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n"
-                                 f"⚡ Приоритет: {task.priority.value}",
-                            reply_markup=task_actions_kb(task.task_id)
-                        )
-                    except Exception as e:
-                        LOGGER.error(f"Ошибка отправки уведомления пользователю {notified_user_id}: {e}")
-            
+                user = USERS.get(notified_user_id)
+                if user is None:
+                    continue
+                try:
+                    await bot.send_message(
+                        chat_id=notified_user_id,
+                        text=(
+                            "🔔 <b>Новая задача назначена!</b>\n\n"
+                            f"📝 <b>{task.title}</b>\n"
+                            f"👤 Ответственный: {responsible_name}\n"
+                            f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n"
+                            f"⚡ Приоритет: {task.priority.value}"
+                        ),
+                        reply_markup=task_actions_kb(task.task_id)
+                    )
+                except Exception as e:
+                    LOGGER.error(f"Ошибка отправки уведомления пользователю {notified_user_id}: {e}")
+
             # Сообщение автору
             await callback.message.edit_text(
-                "✅ <b>Задача успешно создана!</b>\n\n"
-                f"📝 <b>{task_info['title']}</b>\n"
-                f"📄 Описание: {task_info['description'] or 'Не указано'}\n"
-                f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n"
-                f"⚡ Приоритет: {task_info['priority']}\n"
-                f"🏢 Проект: {PROJECTS[task_info['project']]}\n"
-                f"🎯 Направление: {DIRECTIONS[task_info['direction']]}\n"
+                "✅ <b>Задача успешно создана!</b>\n\n",
+                f"📝 <b>{task.title}</b>\n",
+                f"📄 Описание: {task.description or 'Не указано'}\n",
+                f"📅 Срок: {task.due_date.strftime('%d.%m.%Y') if task.due_date else 'Не указан'}\n",
+                f"⚡ Приоритет: {task.priority.value}\n",
+                f"🏢 Проект: {PROJECTS[task.project]}\n",
+                f"🎯 Направление: {get_direction_label(task.direction)}\n",
                 f"👥 Участников: {len(all_notified_users)}",
                 reply_markup=main_menu_kb()
             )
-            
+
+
             # Очищаем данные
             del task_data[user_id]
             await state.clear()

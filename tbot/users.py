@@ -1,7 +1,9 @@
 """Данные пользователей системы задач."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,38 +66,106 @@ USERS: Dict[int, User] = {
 }
 
 
-# Направления пользователей
-USER_DIRECTIONS: Dict[int, Tuple[str, ...]] = {
-    1311714242: ("СТН",),
-    609995295: ("Все направления",),
-    459228268: ("НОиМ",),
-    5055233726: ("СТН",),
-    7216096348: ("СТН",),
-    678543417: ("НМСД", "ОАН", "СТН"),
-    5575874649: ("СТН", "НиА"),
-    7247710860: ("ОАН", "НОиМ", "НМСД", "НиА"),
+# Словарь направлений и человеко-понятных названий
+DIRECTION_LABELS: Dict[str, str] = {
+    "all": "Все направления",
+    "stn": "Социально-творческое направление (СТН)",
+    "oan": "Организационно-аналитическое направление (ОАН)",
+    "nmsd": "Направление маркетинга, смм, дизайна (НМСД)",
+    "noim": "Направление обучения и методологии (НОиМ)",
+    "nnia": "Направление набора и адаптации (ННиА)",
 }
 
 
-def get_users_by_direction(direction: str) -> list[User]:
+# Направления пользователей (используем коды направлений)
+USER_DIRECTIONS: Dict[int, tuple[str, ...]] = {
+    1311714242: ("stn",),
+    609995295: ("all",),
+    459228268: ("noim",),
+    5055233726: ("stn",),
+    7216096348: ("stn",),
+    678543417: ("nmsd", "oan", "stn"),
+    5575874649: ("stn", "nnia"),
+    7247710860: ("oan", "noim", "nmsd", "nnia"),
+}
+
+
+def _normalize_direction(direction: str) -> Optional[str]:
+    """Приводит значение направления к стандартному коду."""
+
+    if not direction:
+        return None
+
+    normalized = direction.strip().lower()
+
+    # Сначала пытаемся найти точное совпадение с кодом
+    if normalized in DIRECTION_LABELS:
+        return normalized
+
+    # Проверяем совпадение с полным названием направления
+    for code, label in DIRECTION_LABELS.items():
+        label_lower = label.lower()
+        if normalized == label_lower:
+            return code
+
+        # Учитываем короткое обозначение в скобках
+        if "(" in label_lower and ")" in label_lower:
+            short_name = label_lower.split("(")[-1].split(")")[0].strip()
+            if normalized == short_name:
+                return code
+
+        # Учитываем форму без скобок и лишних символов
+        stripped_label = label_lower.split("(")[0].strip()
+        if normalized == stripped_label:
+            return code
+
+    # Дополнительные ручные алиасы для часто встречающихся вариантов
+    aliases = {
+        "ниа": "nnia",
+        "нна": "nnia",
+        "нниа": "nnia",
+        "все": "all",
+    }
+
+    return aliases.get(normalized)
+
+
+def get_direction_label(direction: str) -> str:
+    """Возвращает человеко-понятное название направления."""
+
+    code = _normalize_direction(direction)
+    if code is None:
+        return direction
+    return DIRECTION_LABELS[code]
+
+
+def get_users_by_direction(direction: str) -> List[User]:
     """Возвращает список пользователей по направлению."""
-    users = []
-    direction_key = direction.upper()
-    
+
+    code = _normalize_direction(direction)
+    if code is None:
+        return []
+
+    if code == "all":
+        return list(USERS.values())
+
+    result: List[User] = []
+
     for user_id, user_directions in USER_DIRECTIONS.items():
-        if direction_key in user_directions or "Все направления" in user_directions:
-            if user_id in USERS:
-                users.append(USERS[user_id])
-    
-    return users
+        if code in user_directions or "all" in user_directions:
+            user = USERS.get(user_id)
+            if user is not None:
+                result.append(user)
+
+    return result
 
 
 def is_user_in_direction(user_id: int, direction: str) -> bool:
     """Проверяет, принадлежит ли пользователь к направлению."""
-    if user_id not in USER_DIRECTIONS:
+
+    code = _normalize_direction(direction)
+    if code is None:
         return False
-    
-    user_directions = USER_DIRECTIONS[user_id]
-    direction_key = direction.upper()
-    
-    return direction_key in user_directions or "Все направления" in user_directions
+
+    user_directions = USER_DIRECTIONS.get(user_id, ())
+    return code in user_directions or "all" in user_directions

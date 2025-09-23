@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
-import uuid
+from typing import Iterable, List, Optional
 
 
 class TaskStatus(Enum):
@@ -62,15 +61,14 @@ def create_task(
     project: str = "",
     direction: str = "",
     responsible_user_id: int = 0,
-    workgroup: List[int] = None,
+    workgroup: Optional[Iterable[int]] = None,
     is_private: bool = False
 ) -> Task:
     """Создает новую задачу."""
     global _task_id_counter
-    
-    if workgroup is None:
-        workgroup = []
-    
+
+    workgroup_list = list(workgroup) if workgroup is not None else []
+
     task = Task(
         task_id=_task_id_counter,
         title=title,
@@ -82,13 +80,13 @@ def create_task(
         project=project,
         direction=direction,
         responsible_user_id=responsible_user_id,
-        workgroup=workgroup,
+        workgroup=workgroup_list,
         is_private=is_private
     )
-    
+
     TASKS[_task_id_counter] = task
     _task_id_counter += 1
-    
+
     return task
 
 
