@@ -169,8 +169,17 @@ def filter_activity_feed(
         if entry.actor_id == viewer_id:
             visible.append(entry)
             continue
-        if entry.is_status_change and viewer_id in entry.related_participants:
-            visible.append(entry)
+
+        if not entry.is_status_change:
+            continue
+
+        if viewer_id not in entry.related_participants:
+            continue
+
+        if entry.actor_id == author_id and len(entry.related_participants) > 1:
+            continue
+
+        visible.append(entry)
 
     return visible
 

@@ -2169,14 +2169,11 @@ def create_dispatcher() -> Dispatcher:
             await callback.answer("Нет прав для изменения задачи", show_alert=True)
             return
 
-        role = detect_user_role(task, user_id)
-        if role in {"author", "responsible"}:
-            set_all_participants_status(task, TaskStatus.PAUSED)
+        # Даже автор и ответственный ставят на паузу только себя, поэтому не
+        # вызываем массовое обновление статусов участников.
+        set_participant_status(task, user_id, TaskStatus.PAUSED)
+        if task.current_executor_id == user_id:
             task.current_executor_id = None
-        else:
-            set_participant_status(task, user_id, TaskStatus.PAUSED)
-            if task.current_executor_id == user_id:
-                task.current_executor_id = None
 
         task.status_before_overdue = None
         recalc_task_status(task)
