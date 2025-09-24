@@ -35,6 +35,19 @@ class ActivityEntry:
     is_status_change: bool = False
     related_participants: frozenset[int] = field(default_factory=frozenset)
 
+    def __post_init__(self) -> None:
+        """Нормализует участников, связанных с событием."""
+
+        # В источниках данных поле может приходить в разных форматах или вовсе быть пустым.
+        # Приводим его к неизменяемому набору, чтобы дальнейшая логика работала стабильно.
+        participants = self.related_participants
+        if not participants:
+            object.__setattr__(self, "related_participants", frozenset())
+            return
+
+        if not isinstance(participants, frozenset):
+            object.__setattr__(self, "related_participants", frozenset(participants))
+
 
 def personal_section(status: PersonalStatus) -> str:
     """Возвращает название персонального раздела для статуса."""
