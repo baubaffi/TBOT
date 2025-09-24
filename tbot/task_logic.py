@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, List, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, Sequence, Set
 
 
 class PersonalStatus(Enum):
@@ -47,6 +47,18 @@ def personal_section(status: PersonalStatus) -> str:
         PersonalStatus.DONE: "Выполненные",
     }
     return section_titles[status]
+
+
+def personal_sections_for_participants(
+    participant_statuses: Mapping[int, PersonalStatus]
+) -> Dict[int, str]:
+    """Возвращает отображение участника к названию персонального раздела."""
+
+    # Каждый участник видит задачу в разделе, который соответствует его статусу.
+    return {
+        participant_id: personal_section(status)
+        for participant_id, status in participant_statuses.items()
+    }
 
 
 def visible_participants(participants: Iterable[int], author_id: int) -> List[int]:

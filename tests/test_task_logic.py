@@ -7,6 +7,7 @@ from tbot.task_logic import (
     calculate_global_status,
     filter_activity_feed,
     personal_section,
+    personal_sections_for_participants,
     recipients_on_confirmation,
     recipients_on_take,
     should_show_take_button,
@@ -20,6 +21,45 @@ def test_personal_section_titles():
     assert personal_section(PersonalStatus.ON_REVIEW) == "На проверке"
     assert personal_section(PersonalStatus.CONFIRMED) == "Выполненные"
     assert personal_section(PersonalStatus.DONE) == "Выполненные"
+
+
+def test_personal_sections_for_participants_mapping():
+    statuses = {
+        1: PersonalStatus.NEW,
+        2: PersonalStatus.IN_PROGRESS,
+        3: PersonalStatus.ON_REVIEW,
+        4: PersonalStatus.CONFIRMED,
+        5: PersonalStatus.DONE,
+    }
+
+    sections = personal_sections_for_participants(statuses)
+
+    assert sections[1] == "Новые"
+    assert sections[2] == "В работе"
+    assert sections[3] == "На проверке"
+    assert sections[4] == "Выполненные"
+    assert sections[5] == "Выполненные"
+
+
+def test_personal_sections_for_participants_examples():
+    statuses = {
+        10: PersonalStatus.ON_REVIEW,
+        11: PersonalStatus.NEW,
+        12: PersonalStatus.NEW,
+    }
+
+    sections = personal_sections_for_participants(statuses)
+
+    assert sections[10] == "На проверке"
+    assert sections[11] == "Новые"
+    assert sections[12] == "Новые"
+
+    statuses[10] = PersonalStatus.IN_PROGRESS
+    sections = personal_sections_for_participants(statuses)
+
+    assert sections[10] == "В работе"
+    assert sections[11] == "Новые"
+    assert sections[12] == "Новые"
 
 
 def test_visible_participants_excludes_author():
@@ -60,6 +100,11 @@ def test_should_show_take_button(author_id, responsible_id, user_id, expected):
                 PersonalStatus.CONFIRMED,
                 PersonalStatus.DONE,
             ],
+            False,
+            GlobalStatus.ON_REVIEW,
+        ),
+        (
+            [PersonalStatus.ON_REVIEW, PersonalStatus.ON_REVIEW],
             False,
             GlobalStatus.ON_REVIEW,
         ),
