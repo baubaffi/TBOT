@@ -1213,8 +1213,9 @@ def create_dispatcher() -> Dispatcher:
         if user_id not in task_data:
             await state.clear()
             await message.answer("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await message.delete()
             return
-        
+
         task_data[user_id]['title'] = message.text.strip()
         await state.set_state(TaskCreation.waiting_for_description)
 
@@ -1260,8 +1261,9 @@ def create_dispatcher() -> Dispatcher:
         if user_id not in task_data:
             await state.clear()
             await message.answer("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await message.delete()
             return
-        
+
         description = message.text.strip() if message.text != '-' else ''
         task_data[user_id]['description'] = description
         await state.set_state(TaskCreation.waiting_for_due_date)
@@ -1310,12 +1312,14 @@ def create_dispatcher() -> Dispatcher:
         if user_id not in task_data:
             await state.clear()
             await message.answer("Сессия создания задачи устарела. Начните заново.", reply_markup=main_menu_kb())
+            await message.delete()
             return
-        
+
         if message.text != '-':
             due_date = parse_date(message.text)
             if not due_date:
                 await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ или ДД-ММ-ГГГГ")
+                await message.delete()
                 return
             task_data[user_id]['due_date'] = due_date
         else:
@@ -2565,6 +2569,7 @@ def create_dispatcher() -> Dispatcher:
         if not update_info:
             await state.clear()
             await message.answer("Данные об обновлении задачи не найдены", reply_markup=main_menu_kb())
+            await message.delete()
             return
 
         new_due_date = parse_date(message.text)
