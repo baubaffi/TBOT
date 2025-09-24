@@ -25,6 +25,7 @@ from .tasks import (
     delete_task as remove_task,
     get_involved_tasks,
     get_participant_status,
+    get_personal_status_for_user,
     get_task_participants,
     is_user_involved,
     record_task_action,
@@ -659,20 +660,22 @@ async def send_task_reminder(
     refresh_task_status(task)
     actor_name = get_user_full_name(actor_id)
     due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
-    reminder_text = (
-        "🔔 <b>Напоминание о задаче</b>\n\n"
-        f"📝 <b>{task.title}</b>\n"
-        f"👤 От: {actor_name}\n"
-        f"📆 Срок: {due_date}\n"
-        f"📊 Статус: {task.status.value}\n\n"
-        "Пожалуйста, уделите внимание выполнению задачи."
-    )
-
     for recipient_id in recipients:
         user = USERS.get(recipient_id)
         if user is None:
             continue
         try:
+            personal_status = get_personal_status_for_user(task, recipient_id)
+            status_icon = STATUS_ICONS.get(personal_status, "❓")
+            overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
+            reminder_text = (
+                "🔔 <b>Напоминание о задаче</b>\n\n"
+                f"📝 <b>{task.title}</b>\n"
+                f"👤 От: {actor_name}\n"
+                f"📆 Срок: {due_date}\n"
+                f"📊 Статус: {overdue_icon}{status_icon} {personal_status.value}\n\n"
+                "Пожалуйста, уделите внимание выполнению задачи."
+            )
             reminder_keyboard = build_reminder_keyboard(task, recipient_id)
             await bot.send_message(
                 chat_id=recipient_id,
@@ -687,8 +690,13 @@ async def send_task_reminder(
             )
 
 
-def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str:
-    """Формирует текстовое представление списка задач с нумерацией."""
+def build_tasks_list_text(
+    tasks: list[Task],
+    filter_text: str,
+    page: int,
+    viewer_id: int | None = None,
+) -> str:
+    """Формирует текстовое представление списка задач с учётом зрителя."""
 
     total_pages = max(1, (len(tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE)
     start_index = (page - 1) * TASKS_PER_PAGE
@@ -699,7 +707,8 @@ def build_tasks_list_text(tasks: list[Task], filter_text: str, page: int) -> str
 
     for idx, task in enumerate(page_tasks, start=start_index + 1):
         refresh_task_status(task)
-        status_icon = STATUS_ICONS.get(task.status, "❓")
+        personal_status = get_personal_status_for_user(task, viewer_id)
+        status_icon = STATUS_ICONS.get(personal_status, "❓")
         priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
         overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
         responsible_name = get_user_full_name(task.responsible_user_id)
@@ -742,7 +751,9 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
     description = task.description or "Не указано"
     project_name = PROJECTS.get(task.project, "Не указан")
     direction_name = get_direction_label(task.direction) if task.direction else "Не указано"
-    status_icon = STATUS_ICONS.get(task.status, "❓")
+    personal_status = get_personal_status_for_user(task, viewer_id)
+    status_icon = STATUS_ICONS.get(personal_status, "❓")
+    overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
     priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
     executor_name = None
     if task.current_executor_id and task.current_executor_id in USERS:
@@ -751,7 +762,7 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
     lines = [
         f"📝 <b>{task.title}</b>",
         "",
-        f"{status_icon} Статус: {task.status.value}",
+        f"{overdue_icon}{status_icon} Статус: {personal_status.value}",
         f"{priority_icon} Приоритет: {task.priority.value}",
         f"📄 Описание: {description}",
         f"📅 Создана: {created}",
@@ -1988,7 +1999,7 @@ def create_dispatcher() -> Dispatcher:
             return
 
         page = 1
-        tasks_text = build_tasks_list_text(tasks, filter_text, page)
+        tasks_text = build_tasks_list_text(tasks, filter_text, page, user_id)
         keyboard = tasks_list_kb(tasks, view, filter_type, page)
 
         await safe_edit_message(
@@ -2017,7 +2028,7 @@ def create_dispatcher() -> Dispatcher:
             page = 1
         page = max(1, min(page, total_pages))
 
-        tasks_text = build_tasks_list_text(tasks, filter_text, page)
+        tasks_text = build_tasks_list_text(tasks, filter_text, page, user_id)
         keyboard = tasks_list_kb(tasks, view, filter_type, page)
 
         await safe_edit_message(
@@ -2124,7 +2135,7 @@ def create_dispatcher() -> Dispatcher:
 
         total_pages = max(1, (len(tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE)
         page = max(1, min(page, total_pages))
-        tasks_text = build_tasks_list_text(tasks, filter_text, page)
+        tasks_text = build_tasks_list_text(tasks, filter_text, page, user_id)
         keyboard = tasks_list_kb(tasks, view, filter_type, page)
 
         await safe_edit_message(

@@ -227,6 +227,8 @@ def set_participant_status(task: Task, user_id: int, status: TaskStatus) -> None
 
     ensure_participant_entry(task, user_id)
     task.participant_statuses[user_id] = status
+    if user_id != task.author_id:
+        _sync_author_status(task)
 
 
 def set_all_participants_status(task: Task, status: TaskStatus) -> None:
@@ -234,6 +236,7 @@ def set_all_participants_status(task: Task, status: TaskStatus) -> None:
 
     for participant_id in get_task_participants(task):
         set_participant_status(task, participant_id, status)
+    _sync_author_status(task)
 
 
 def get_participant_status(task: Task, user_id: int) -> TaskStatus:
@@ -241,6 +244,58 @@ def get_participant_status(task: Task, user_id: int) -> TaskStatus:
 
     ensure_participant_entry(task, user_id)
     return task.participant_statuses[user_id]
+
+
+def get_personal_status_for_user(task: Task, user_id: Optional[int]) -> TaskStatus:
+    """Возвращает статус задачи для конкретного пользователя."""
+
+    if user_id is None:
+        return task.status
+
+    if user_id not in get_task_participants(task):
+        return task.status
+
+    ensure_participant_entry(task, user_id)
+    return task.participant_statuses[user_id]
+
+
+def _sync_author_status(task: Task) -> None:
+    """Синхронизирует статус автора с текущей активностью участников."""
+
+    participants = [
+        participant_id
+        for participant_id in get_task_participants(task)
+        if participant_id != task.author_id
+    ]
+
+    # Если других участников нет, оставляем статус автора без изменений.
+    if not participants:
+        return
+
+    ensure_participant_entry(task, task.author_id)
+
+    if task.awaiting_author_confirmation and task.pending_confirmations:
+        task.participant_statuses[task.author_id] = TaskStatus.IN_REVIEW
+        return
+
+    participant_statuses = [
+        get_participant_status(task, participant_id)
+        for participant_id in participants
+    ]
+
+    if any(status == TaskStatus.ACTIVE for status in participant_statuses):
+        task.participant_statuses[task.author_id] = TaskStatus.ACTIVE
+        return
+
+    if any(status == TaskStatus.PAUSED for status in participant_statuses):
+        task.participant_statuses[task.author_id] = TaskStatus.PAUSED
+        return
+
+    if all(status == TaskStatus.COMPLETED for status in participant_statuses):
+        task.participant_statuses[task.author_id] = TaskStatus.COMPLETED
+        return
+
+    task.participant_statuses[task.author_id] = TaskStatus.NEW
 
 
 def calculate_overall_status(task: Task) -> TaskStatus:
@@ -282,6 +337,7 @@ def recalc_task_status(task: Task) -> None:
     else:
         task.status = new_status
         task.status_before_overdue = None
+    _sync_author_status(task)
 
 
 def add_pending_confirmation(task: Task, user_id: int) -> None:
