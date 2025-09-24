@@ -540,7 +540,19 @@ async def notify_task_participants(
 
     recipients = set(get_task_participants(task))
 
+    workgroup_participants = set(task.workgroup)
+    actor_in_workgroup = actor_id in workgroup_participants
+
     for recipient_id in recipients:
+        if (
+            actor_in_workgroup
+            and recipient_id != actor_id
+            and recipient_id in workgroup_participants
+            and recipient_id not in {task.author_id, task.responsible_user_id}
+        ):
+            # Если действие выполняет участник рабочей группы, не уведомляем остальных
+            # членов этой группы, кроме автора и ответственного.
+            continue
         user = USERS.get(recipient_id)
         if user is None:
             continue
