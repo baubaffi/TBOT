@@ -2283,7 +2283,10 @@ def create_dispatcher() -> Dispatcher:
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
         await callback.answer("Задача на паузе")
 
-    @dispatcher.callback_query(F.data.startswith("complete_task"))
+    @dispatcher.callback_query(
+        F.data.startswith("complete_task")
+        & ~F.data.startswith("complete_task_author")
+    )
     async def handle_complete_task(callback: CallbackQuery, state: FSMContext) -> None:
         """Обрабатывает завершение задачи."""
 
