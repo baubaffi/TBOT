@@ -181,3 +181,27 @@ def test_filter_activity_feed_for_participant():
     ]
     visible = filter_activity_feed(entries, viewer_id=3, author_id=1)
     assert visible == [entries[1], entries[3]]
+
+
+def test_filter_activity_feed_ignores_mass_author_actions():
+    entries = [
+        ActivityEntry(
+            actor_id=1,
+            description="pause all",
+            is_status_change=True,
+            related_participants=frozenset({2, 3}),
+        ),
+    ]
+    assert filter_activity_feed(entries, viewer_id=2, author_id=1) == []
+
+
+def test_filter_activity_feed_keeps_targeted_author_action():
+    entries = [
+        ActivityEntry(
+            actor_id=1,
+            description="pause one",
+            is_status_change=True,
+            related_participants=frozenset({2}),
+        ),
+    ]
+    assert filter_activity_feed(entries, viewer_id=2, author_id=1) == entries
