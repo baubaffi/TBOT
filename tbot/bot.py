@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable
+from typing import Callable, Iterable
 from .greeting import greet_user
 from .users import USERS, User, get_direction_label, get_users_by_direction
 from .task_logic import should_show_take_button
@@ -476,7 +476,59 @@ def get_allowed_reminder_targets(task: Task, actor_id: int) -> set[int]:
     return participants
 
 
-async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_description: str) -> None:
+def _notification_open_keyboard(task: Task) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру с кнопкой открытия задачи и возвратом на главную."""
+
+    context = f"{task.task_id}:notify:all:1"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📂 Открыть задачу",
+                    callback_data=f"task_detail:{context}",
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
+        ]
+    )
+
+
+def _notification_review_keyboard(
+    task: Task,
+    performer_id: int,
+    performer_name: str,
+) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру уведомления с подтверждением выполнения."""
+
+    context = f"{task.task_id}:notify:all:1"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📂 Открыть задачу",
+                    callback_data=f"task_detail:{context}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Подтвердить выполнение: {performer_name}",
+                    callback_data=(
+                        f"confirm_completion:{task.task_id}:{performer_id}:notify:all:1"
+                    ),
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="back_main")],
+        ]
+    )
+
+
+async def notify_task_participants(
+    bot: Bot,
+    task: Task,
+    actor_id: int,
+    action_description: str,
+    keyboard_builder: Callable[[int], InlineKeyboardMarkup | None] | None = None,
+) -> None:
     """Отправляет уведомление всем участникам о действии по задаче."""
 
     actor_name = get_user_full_name(actor_id)
@@ -492,14 +544,52 @@ async def notify_task_participants(bot: Bot, task: Task, actor_id: int, action_d
         user = USERS.get(recipient_id)
         if user is None:
             continue
+        reply_markup = None
+        if keyboard_builder is not None:
+            reply_markup = keyboard_builder(recipient_id)
         try:
-            await bot.send_message(chat_id=recipient_id, text=notification_text)
+            await bot.send_message(
+                chat_id=recipient_id,
+                text=notification_text,
+                reply_markup=reply_markup,
+            )
         except Exception as error:
             LOGGER.error(
                 "Не удалось отправить уведомление пользователю %s: %s",
                 recipient_id,
                 error,
             )
+
+
+def _build_take_notification_keyboard(
+    task: Task,
+    actor_id: int,
+    recipient_id: int,
+) -> InlineKeyboardMarkup | None:
+    """Подбирает клавиатуру уведомления, когда участник взял задачу."""
+
+    if recipient_id == actor_id:
+        return None
+    if recipient_id not in {task.author_id, task.responsible_user_id}:
+        return None
+    return _notification_open_keyboard(task)
+
+
+def _build_review_notification_keyboard(
+    task: Task,
+    performer_id: int,
+    recipient_id: int,
+) -> InlineKeyboardMarkup | None:
+    """Подбирает клавиатуру уведомления при отправке работы на проверку."""
+
+    if recipient_id == performer_id:
+        return None
+    if recipient_id not in {task.author_id, task.responsible_user_id}:
+        return None
+    if recipient_id == task.responsible_user_id:
+        performer_name = get_user_full_name(performer_id)
+        return _notification_review_keyboard(task, performer_id, performer_name)
+    return _notification_open_keyboard(task)
 
 
 def build_reminder_keyboard(task: Task, recipient_id: int) -> InlineKeyboardMarkup:
@@ -2151,6 +2241,11 @@ def create_dispatcher() -> Dispatcher:
             task,
             user_id,
             "взял(а) задачу в работу.",
+            keyboard_builder=lambda recipient: _build_take_notification_keyboard(
+                task,
+                user_id,
+                recipient,
+            ),
         )
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
@@ -2227,6 +2322,15 @@ def create_dispatcher() -> Dispatcher:
             task,
             user_id,
             action_note,
+            keyboard_builder=(
+                None
+                if role != "workgroup"
+                else lambda recipient: _build_review_notification_keyboard(
+                    task,
+                    user_id,
+                    recipient,
+                )
+            ),
         )
 
         await render_task_detail(callback.message, task, user_id, view, filter_type, page)
@@ -2576,8 +2680,11 @@ def create_dispatcher() -> Dispatcher:
             return
 
         user_id = callback.from_user.id
-        if user_id != task.author_id:
-            await callback.answer("Подтверждать выполнение может только автор", show_alert=True)
+        if user_id not in {task.author_id, task.responsible_user_id}:
+            await callback.answer(
+                "Подтверждать выполнение могут только автор и ответственный",
+                show_alert=True,
+            )
             return
 
         participant_name = get_user_full_name(participant_id)
