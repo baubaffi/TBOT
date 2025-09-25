@@ -45,4 +45,5 @@ def test_workgroup_members_do_not_notify_each_other() -> None:
 
     assert 7247710860 in recipients
     assert 609995295 in recipients
+    assert 1311714242 not in recipients
     assert 678543417 not in recipients
