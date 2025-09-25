@@ -540,6 +540,7 @@ async def notify_task_participants(
     )
 
     recipients = set(get_task_participants(task))
+    recipients.discard(actor_id)
 
     workgroup_participants = set(task.workgroup)
     actor_in_workgroup = actor_id in workgroup_participants
