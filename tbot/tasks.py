@@ -54,6 +54,7 @@ class Task:
     participant_statuses: Dict[int, TaskStatus] = field(default_factory=dict)
     pending_confirmations: Set[int] = field(default_factory=set)
     awaiting_author_confirmation: bool = False
+    personal_due_dates: Dict[int, datetime] = field(default_factory=dict)
 
 
 # Хранилище задач (временное, в памяти)
@@ -222,6 +223,30 @@ def ensure_participant_entry(task: Task, user_id: int) -> None:
         task.participant_statuses[user_id] = TaskStatus.NEW
 
 
+def set_personal_due_date(task: Task, user_id: int, due_date: datetime) -> None:
+    """Сохраняет персональный срок сдачи для участника."""
+
+    task.personal_due_dates[user_id] = due_date
+
+
+def clear_personal_due_date(task: Task, user_id: int) -> None:
+    """Удаляет индивидуальный срок сдачи участника."""
+
+    task.personal_due_dates.pop(user_id, None)
+
+
+def clear_all_personal_due_dates(task: Task) -> None:
+    """Удаляет все персональные сроки сдачи."""
+
+    task.personal_due_dates.clear()
+
+
+def get_personal_due_date(task: Task, user_id: int) -> Optional[datetime]:
+    """Возвращает персональный срок сдачи для участника, если он задан."""
+
+    return task.personal_due_dates.get(user_id)
+
+
 def set_participant_status(task: Task, user_id: int, status: TaskStatus) -> None:
     """Устанавливает индивидуальный статус участника."""
 
@@ -244,6 +269,18 @@ def get_participant_status(task: Task, user_id: int) -> TaskStatus:
 
     ensure_participant_entry(task, user_id)
     return task.participant_statuses[user_id]
+
+
+def get_effective_due_date(task: Task, user_id: Optional[int]) -> Optional[datetime]:
+    """Определяет срок сдачи задачи с учётом персональных переносов."""
+
+    if user_id is None:
+        return task.due_date
+
+    if user_id in {task.author_id, task.responsible_user_id}:
+        return task.due_date
+
+    return get_personal_due_date(task, user_id) or task.due_date
 
 
 def get_personal_status_for_user(task: Task, user_id: Optional[int]) -> TaskStatus:

@@ -20,11 +20,14 @@ from .tasks import (
     TaskStatus,
     TASKS,
     add_pending_confirmation,
+    clear_all_personal_due_dates,
     clear_pending_confirmations,
     create_task,
     delete_task as remove_task,
+    get_effective_due_date,
     get_involved_tasks,
     get_participant_status,
+    get_personal_due_date,
     get_personal_status_for_user,
     get_task_participants,
     is_user_involved,
@@ -35,6 +38,7 @@ from .tasks import (
     remove_pending_confirmation,
     set_all_participants_status,
     set_participant_status,
+    set_personal_due_date,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -660,12 +664,17 @@ async def send_task_reminder(
 
     refresh_task_status(task)
     actor_name = get_user_full_name(actor_id)
-    due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
     for recipient_id in recipients:
         user = USERS.get(recipient_id)
         if user is None:
             continue
         try:
+            recipient_due_date = get_effective_due_date(task, recipient_id)
+            due_date_text = (
+                recipient_due_date.strftime('%d.%m.%Y')
+                if recipient_due_date
+                else "Не указан"
+            )
             personal_status = get_personal_status_for_user(task, recipient_id)
             status_icon = STATUS_ICONS.get(personal_status, "❓")
             overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
@@ -673,7 +682,7 @@ async def send_task_reminder(
                 "🔔 <b>Напоминание о задаче</b>\n\n"
                 f"📝 <b>{task.title}</b>\n"
                 f"👤 От: {actor_name}\n"
-                f"📆 Срок: {due_date}\n"
+                f"📆 Срок: {due_date_text}\n"
                 f"📊 Статус: {overdue_icon}{status_icon} {personal_status.value}\n\n"
                 "Пожалуйста, уделите внимание выполнению задачи."
             )
@@ -713,7 +722,12 @@ def build_tasks_list_text(
         priority_icon = PRIORITY_ICONS.get(task.priority, "⚪")
         overdue_icon = "⏰ " if task.status == TaskStatus.OVERDUE else ""
         responsible_name = get_user_full_name(task.responsible_user_id)
-        due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Без срока"
+        viewer_due_date = get_effective_due_date(task, viewer_id)
+        due_date = (
+            viewer_due_date.strftime('%d.%m.%Y')
+            if viewer_due_date
+            else "Без срока"
+        )
 
         lines.extend([
             f"{idx}. {status_icon} {priority_icon} {overdue_icon}<b>{task.title}</b>",
@@ -741,7 +755,10 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
 
     responsible_name = get_user_full_name(task.responsible_user_id)
     author_name = get_user_full_name(task.author_id)
-    due_date = task.due_date.strftime('%d.%m.%Y') if task.due_date else "Не указан"
+    viewer_due_date = get_effective_due_date(task, viewer_id)
+    due_date = (
+        viewer_due_date.strftime('%d.%m.%Y') if viewer_due_date else "Не указан"
+    )
     created = task.created_date.strftime('%d.%m.%Y')
     workgroup_names = [
         get_user_full_name(user_id)
@@ -805,8 +822,16 @@ def build_task_detail_text(task: Task, viewer_id: int | None = None) -> str:
             marker = ""
             if participant_id in task.pending_confirmations:
                 marker = " (ожидает подтверждения)"
+            postpone_note = ""
+            if participant_id not in {task.author_id, task.responsible_user_id}:
+                personal_due = get_personal_due_date(task, participant_id)
+                if personal_due:
+                    postpone_note = (
+                        " — Отложил до "
+                        f"{personal_due.strftime('%d.%m.%Y')}"
+                    )
             participant_lines.append(
-                f"   • {participant_name} ({role_label}) — {participant_status}{marker}"
+                f"   • {participant_name} ({role_label}) — {participant_status}{marker}{postpone_note}"
             )
 
         if participant_lines:
@@ -2650,14 +2675,16 @@ def create_dispatcher() -> Dispatcher:
             await message.delete()
             return
 
-        new_due_date = update_info["new_due_date"]
-        task.due_date = new_due_date
-        task.status_before_overdue = None
-
         role = detect_user_role(task, user_id)
+        new_due_date = update_info["new_due_date"]
+
         if role in {"author", "responsible"}:
+            task.due_date = new_due_date
+            task.status_before_overdue = None
+            clear_all_personal_due_dates(task)
             recalc_task_status(task)
         else:
+            set_personal_due_date(task, user_id, new_due_date)
             set_participant_status(task, user_id, TaskStatus.PAUSED)
             if task.current_executor_id == user_id:
                 task.current_executor_id = None
